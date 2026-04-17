@@ -3,28 +3,23 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import ta
-from xgboost import XGBClassifier
 import requests
 import time
 
 st.set_page_config(layout="wide")
-st.title("🚀 PRO AI TRADING SYSTEM (India)")
+st.title("🚀 PRO MULTI-STRATEGY TRADING SYSTEM")
 
-# =========================
-# CONFIG
-# =========================
+# ================= CONFIG =================
 NIFTY50 = [
     "RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","ICICIBANK.NS",
     "SBIN.NS","LT.NS","ITC.NS","AXISBANK.NS","KOTAKBANK.NS"
 ]
 
 CAPITAL = 100000
-RISK_PER_TRADE = 0.02
-BROKERAGE = 0.0005  # 0.05%
+RISK = 0.02
+BROKERAGE = 0.0005
 
-# =========================
-# TELEGRAM
-# =========================
+# ================= TELEGRAM =================
 def send_telegram(msg):
     try:
         token = st.secrets["TELEGRAM_TOKEN"]
@@ -34,213 +29,192 @@ def send_telegram(msg):
     except:
         pass
 
-# =========================
-# DATA
-# =========================
+# ================= DATA =================
 @st.cache_data
 def get_data(ticker, mode):
     if mode == "Intraday":
         return yf.download(ticker, period="5d", interval="5m")
-    else:
-        return yf.download(ticker, period="1y", interval="1d")
+    return yf.download(ticker, period="1y", interval="1d")
 
-# =========================
-# FEATURES
-# =========================
+# ================= FEATURES =================
 def add_features(df):
-
-    df['rsi'] = ta.momentum.RSIIndicator(df['Close']).rsi()
-    df['ema50'] = ta.trend.EMAIndicator(df['Close'], 50).ema_indicator()
     df['ema200'] = ta.trend.EMAIndicator(df['Close'], 200).ema_indicator()
-
-    # ATR for stop loss
     df['atr'] = ta.volatility.AverageTrueRange(
         df['High'], df['Low'], df['Close']).average_true_range()
 
-    # VWAP (intraday)
     df['vwap'] = (df['Close'] * df['Volume']).cumsum() / df['Volume'].cumsum()
 
-    df['vol_avg'] = df['Volume'].rolling(20).mean()
-    df['vol_spike'] = df['Volume'] / df['vol_avg']
+    return df.dropna()
 
-    df['returns_5'] = df['Close'].pct_change(5)
-    df['returns_10'] = df['Close'].pct_change(10)
+# ================= STRATEGIES =================
 
-    df['target'] = (df['Close'].shift(-1) > df['Close']).astype(int)
+def macd_adx(df):
+    macd = ta.trend.MACD(df['Close'])
+    adx = ta.trend.ADXIndicator(df['High'], df['Low'], df['Close']).adx()
 
-    df.dropna(inplace=True)
-    return df
+    if macd.macd().iloc[-1] > macd.macd_signal().iloc[-1] and adx.iloc[-1] > 25:
+        return 1
+    elif macd.macd().iloc[-1] < macd.macd_signal().iloc[-1]:
+        return -1
+    return 0
 
-# =========================
-# MODEL
-# =========================
-def train_model(df):
-    features = ['rsi','ema50','ema200','vol_spike','returns_5','returns_10']
+def ema_rsi(df):
+    ema9 = ta.trend.EMAIndicator(df['Close'], 9).ema_indicator()
+    ema21 = ta.trend.EMAIndicator(df['Close'], 21).ema_indicator()
+    rsi = ta.momentum.RSIIndicator(df['Close']).rsi()
 
-    X = df[features]
-    y = df['target']
+    if ema9.iloc[-1] > ema21.iloc[-1] and 40 < rsi.iloc[-1] < 70:
+        return 1
+    elif ema9.iloc[-1] < ema21.iloc[-1]:
+        return -1
+    return 0
 
-    model = XGBClassifier(n_estimators=150, max_depth=5)
-    model.fit(X, y)
+def vwap_bounce(df):
+    if df['Close'].iloc[-1] > df['vwap'].iloc[-1]:
+        return 1
+    elif df['Close'].iloc[-1] < df['vwap'].iloc[-1]:
+        return -1
+    return 0
 
-    return model
+def supertrend(df):
+    atr = df['atr']
+    hl2 = (df['High'] + df['Low']) / 2
+    upper = hl2 + 2*atr
+    lower = hl2 - 2*atr
 
-# =========================
-# SIGNAL ENGINE (IMPROVED)
-# =========================
-def generate_signal(row, prob, mode):
+    if df['Close'].iloc[-1] > upper.iloc[-1]:
+        return 1
+    elif df['Close'].iloc[-1] < lower.iloc[-1]:
+        return -1
+    return 0
 
-    # Market regime
-    regime = 1 if row['Close'] > row['ema200'] else 0
+def bollinger(df):
+    bb = ta.volatility.BollingerBands(df['Close'])
 
-    # Intraday filter
-    if mode == "Intraday":
-        vwap_cond = row['Close'] > row['vwap']
-    else:
-        vwap_cond = True
+    if df['Close'].iloc[-1] > bb.bollinger_hband().iloc[-1]:
+        return 1
+    elif df['Close'].iloc[-1] < bb.bollinger_lband().iloc[-1]:
+        return -1
+    return 0
 
-    tech_score = 1 if regime and vwap_cond else 0
+# ================= ENSEMBLE =================
+def strategy_score(df):
 
-    score = 0.5*prob + 0.5*tech_score
+    signals = [
+        macd_adx(df),
+        ema_rsi(df),
+        vwap_bounce(df),
+        supertrend(df),
+        bollinger(df)
+    ]
 
-    if score > 0.65:
+    score = sum(signals)/len(signals)
+
+    if score > 0.4:
         return "BUY", score
-    elif score < 0.35:
+    elif score < -0.4:
         return "SELL", score
     else:
         return "HOLD", score
 
-# =========================
-# BACKTEST (REALISTIC)
-# =========================
-def backtest(df, model, mode):
+# ================= BACKTEST =================
+def backtest(df):
 
     capital = CAPITAL
     position = 0
-    entry_price = 0
+    entry = 0
     trades = []
-
-    features = ['rsi','ema50','ema200','vol_spike','returns_5','returns_10']
 
     for i in range(len(df)-1):
 
-        row = df.iloc[i]
+        signal, _ = strategy_score(df.iloc[:i+1])
+        price = df['Close'].iloc[i]
         next_price = df['Close'].iloc[i+1]
-
-        prob = model.predict_proba(df.iloc[i:i+1][features])[0][1]
-        signal, _ = generate_signal(row, prob, mode)
-
-        atr = row['atr']
+        atr = df['atr'].iloc[i]
 
         if signal == "BUY" and position == 0:
-
-            risk_amount = capital * RISK_PER_TRADE
-            qty = risk_amount / atr
-
-            entry_price = row['Close']
+            qty = (capital * RISK) / atr
+            entry = price
             position = qty
 
         elif position != 0:
 
-            # SL / TP logic
-            sl = entry_price - atr
-            tp = entry_price + 2*atr
+            sl = entry - atr
+            tp = entry + 2*atr
 
-            exit_price = next_price
+            if next_price <= sl or next_price >= tp or signal == "SELL":
 
-            if exit_price <= sl or exit_price >= tp or signal == "SELL":
-
-                pnl = (exit_price - entry_price) * position
+                pnl = (next_price - entry) * position
                 pnl -= abs(pnl) * BROKERAGE
 
                 capital += pnl
                 trades.append(pnl)
-
                 position = 0
 
     return capital, trades
 
-# =========================
-# METRICS
-# =========================
+# ================= METRICS =================
 def metrics(trades):
-
-    if len(trades) == 0:
-        return 0,0,0
+    if not trades:
+        return 0,0
 
     wins = [t for t in trades if t > 0]
     losses = [t for t in trades if t < 0]
 
     win_rate = len(wins)/len(trades)
-    profit_factor = sum(wins)/abs(sum(losses)) if losses else 0
-    avg_trade = np.mean(trades)
+    pf = sum(wins)/abs(sum(losses)) if losses else 0
 
-    return win_rate, profit_factor, avg_trade
+    return win_rate, pf
 
-# =========================
-# SCANNER
-# =========================
+# ================= SCANNER =================
 def scan(ticker, mode):
 
     df = get_data(ticker, mode)
     df = add_features(df)
 
-    model = train_model(df)
+    signal, score = strategy_score(df)
 
-    latest = df.iloc[-1]
-    features = ['rsi','ema50','ema200','vol_spike','returns_5','returns_10']
-
-    prob = model.predict_proba(df.iloc[-1:][features])[0][1]
-
-    signal, score = generate_signal(latest, prob, mode)
-
-    final_capital, trades = backtest(df, model, mode)
-    win_rate, pf, avg = metrics(trades)
+    final_cap, trades = backtest(df)
+    win_rate, pf = metrics(trades)
 
     return {
-        "ticker": ticker,
-        "signal": signal,
-        "score": round(score,2),
-        "win_rate": round(win_rate,2),
-        "pf": round(pf,2),
-        "capital": int(final_capital)
+        "Stock": ticker,
+        "Signal": signal,
+        "Score": round(score,2),
+        "WinRate": round(win_rate,2),
+        "PF": round(pf,2),
+        "Capital": int(final_cap)
     }
 
-# =========================
-# UI
-# =========================
-mode = st.sidebar.selectbox("Mode", ["Swing", "Intraday"])
-
+# ================= UI =================
+mode = st.sidebar.selectbox("Mode", ["Swing","Intraday"])
 auto = st.sidebar.checkbox("Auto Refresh (5 min)")
 
-if st.button("Run Scan"):
+if st.button("Run Scanner"):
 
     results = []
     progress = st.progress(0)
 
-    for i, ticker in enumerate(NIFTY50):
+    for i, stock in enumerate(NIFTY50):
 
         try:
-            res = scan(ticker, mode)
+            res = scan(stock, mode)
             results.append(res)
 
-            # Telegram alert
-            if res['signal'] == "BUY" and res['score'] > 0.7:
-                send_telegram(f"🚀 BUY {ticker}\nScore: {res['score']}")
+            if res["Signal"] == "BUY" and res["Score"] > 0.6:
+                send_telegram(f"🚀 BUY {stock} | Score: {res['Score']}")
 
         except:
             pass
 
         progress.progress((i+1)/len(NIFTY50))
 
-    df = pd.DataFrame(results).sort_values(by="score", ascending=False)
+    df = pd.DataFrame(results).sort_values(by="Score", ascending=False)
 
     st.subheader("📊 Signals")
     st.dataframe(df)
 
-# =========================
-# AUTO REFRESH
-# =========================
+# ================= AUTO REFRESH =================
 if auto:
     time.sleep(300)
     st.rerun()

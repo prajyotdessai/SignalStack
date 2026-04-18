@@ -7,7 +7,7 @@ import requests
 import time
 import anthropic
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 
 st.set_page_config(layout="wide", page_title="PRO Trading System + AI Sentiment")
 st.title("🚀 PRO MULTI-STRATEGY TRADING SYSTEM + AI SENTIMENT")
@@ -19,11 +19,9 @@ NIFTY50 = [
     "WIPRO.NS",    "HCLTECH.NS",   "TATAMOTORS.NS", "BAJFINANCE.NS","ADANIPORTS.NS",
 ]
 
-CAPITAL   = 100000
-RISK      = 0.02
-BROKERAGE = 0.0005
-
-# Sentiment weight in final score: 0.0 = ignore, 1.0 = only sentiment
+CAPITAL          = 100000
+RISK             = 0.02
+BROKERAGE        = 0.0005
 SENTIMENT_WEIGHT = 0.30
 
 # ================= TELEGRAM =================
@@ -38,20 +36,48 @@ def send_telegram(msg):
 
 # ================= DATA =================
 @st.cache_data(ttl=300)
-def get_data(ticker, mode):
-    if mode == "Intraday":
-        return yf.download(ticker, period="5d", interval="5m", auto_adjust=True)
-    return yf.download(ticker, period="1y", interval="1d", auto_adjust=True)
-
-@st.cache_data(ttl=3600)
-def get_news_headlines(ticker_clean: str) -> list[str]:
+def get_data(ticker: str, mode: str):
     """
-    Fetch recent Yahoo Finance news headlines for a ticker.
-    Falls back to empty list silently if unavailable.
+    Download OHLCV and return a flat single-level DataFrame.
+    Fixes: recent yfinance returns MultiIndex columns like ('Close','RELIANCE.NS')
+    which causes 'Data must be 1-dimensional, got ndarray of shape (248,1)' errors.
     """
     try:
-        t     = yf.Ticker(ticker_clean + ".NS")
-        news  = t.news or []
+        if mode == "Intraday":
+            raw = yf.download(ticker, period="5d", interval="5m",
+                              auto_adjust=True, progress=False)
+        else:
+            raw = yf.download(ticker, period="1y", interval="1d",
+                              auto_adjust=True, progress=False)
+
+        if raw is None or raw.empty:
+            return None
+
+        # ── KEY FIX: flatten MultiIndex columns ──────────────────────────
+        # yfinance >= 0.2.38 returns MultiIndex e.g. ('Close', 'RELIANCE.NS')
+        # Drop the ticker level, keep only the field name ('Close', 'High', etc.)
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+
+        # Remove duplicate columns if any
+        raw = raw.loc[:, ~raw.columns.duplicated()]
+
+        cols_needed = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in raw.columns]
+        df = raw[cols_needed].copy()
+        df = df[~df.index.duplicated(keep="last")]
+        df.sort_index(inplace=True)
+        return df
+
+    except Exception as e:
+        st.warning(f"Download error for {ticker}: {e}")
+        return None
+
+# ================= NEWS =================
+@st.cache_data(ttl=3600)
+def get_news_headlines(ticker_clean: str) -> list:
+    try:
+        t      = yf.Ticker(ticker_clean + ".NS")
+        news   = t.news or []
         titles = [n.get("title", "") for n in news[:8] if n.get("title")]
         return titles
     except Exception:
@@ -60,17 +86,31 @@ def get_news_headlines(ticker_clean: str) -> list[str]:
 # ================= FEATURES =================
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["ema200"] = ta.trend.EMAIndicator(df["Close"], window=200).ema_indicator()
-    df["atr"]    = ta.volatility.AverageTrueRange(
-        df["High"], df["Low"], df["Close"], window=14
-    ).average_true_range()
-    df["vwap"]   = (df["Close"] * df["Volume"]).cumsum() / df["Volume"].cumsum()
+
+    # Squeeze to 1-D Series — belt-and-suspenders guard
+    close  = df["Close"].squeeze()
+    high   = df["High"].squeeze()
+    low    = df["Low"].squeeze()
+    volume = df["Volume"].squeeze()
+
+    df["Close"]  = close
+    df["High"]   = high
+    df["Low"]    = low
+    df["Volume"] = volume
+
+    df["ema200"] = ta.trend.EMAIndicator(close, window=200).ema_indicator()
+    df["atr"]    = ta.volatility.AverageTrueRange(high, low, close, window=14).average_true_range()
+    df["vwap"]   = (close * volume).cumsum() / volume.cumsum()
+
     return df.dropna()
 
 # ================= TECHNICAL STRATEGIES =================
 def macd_adx(df: pd.DataFrame) -> float:
-    macd = ta.trend.MACD(df["Close"])
-    adx  = ta.trend.ADXIndicator(df["High"], df["Low"], df["Close"]).adx()
+    close = df["Close"]
+    high  = df["High"]
+    low   = df["Low"]
+    macd  = ta.trend.MACD(close)
+    adx   = ta.trend.ADXIndicator(high, low, close).adx()
     if macd.macd().iloc[-1] > macd.macd_signal().iloc[-1] and adx.iloc[-1] > 25:
         return 1.0
     elif macd.macd().iloc[-1] < macd.macd_signal().iloc[-1]:
@@ -78,9 +118,10 @@ def macd_adx(df: pd.DataFrame) -> float:
     return 0.0
 
 def ema_rsi(df: pd.DataFrame) -> float:
-    ema9  = ta.trend.EMAIndicator(df["Close"], window=9).ema_indicator()
-    ema21 = ta.trend.EMAIndicator(df["Close"], window=21).ema_indicator()
-    rsi   = ta.momentum.RSIIndicator(df["Close"]).rsi()
+    close = df["Close"]
+    ema9  = ta.trend.EMAIndicator(close, window=9).ema_indicator()
+    ema21 = ta.trend.EMAIndicator(close, window=21).ema_indicator()
+    rsi   = ta.momentum.RSIIndicator(close).rsi()
     if ema9.iloc[-1] > ema21.iloc[-1] and 40 < rsi.iloc[-1] < 70:
         return 1.0
     elif ema9.iloc[-1] < ema21.iloc[-1]:
@@ -113,48 +154,57 @@ def bollinger(df: pd.DataFrame) -> float:
         return -1.0
     return 0.0
 
-# ================= AI SENTIMENT ENGINE =================
-@st.cache_data(ttl=1800)   # cache 30 min per ticker
-def get_ai_sentiment(ticker_clean: str, headlines: list[str],
+# ================= ENSEMBLE =================
+def strategy_score(df: pd.DataFrame):
+    signals = [macd_adx(df), ema_rsi(df), vwap_bounce(df), supertrend(df), bollinger(df)]
+    score   = sum(signals) / len(signals)
+    if score > 0.4:
+        return "BUY", score
+    elif score < -0.4:
+        return "SELL", score
+    return "HOLD", score
+
+def combined_score(tech_score: float, sentiment: dict):
+    w       = SENTIMENT_WEIGHT
+    blended = (1 - w) * tech_score + w * sentiment.get("score", 0.0)
+    if blended > 0.35:
+        label = "BUY"
+    elif blended < -0.35:
+        label = "SELL"
+    else:
+        label = "HOLD"
+    return label, round(blended, 3)
+
+# ================= AI SENTIMENT =================
+@st.cache_data(ttl=1800)
+def get_ai_sentiment(ticker_clean: str, headlines: tuple,
                      price: float, pct_change: float) -> dict:
-    """
-    Call Claude to analyse news headlines + price action and return:
-    {
-      "score":     float in [-1, +1],   # -1 = very bearish, +1 = very bullish
-      "label":     "Bullish" | "Neutral" | "Bearish",
-      "confidence": int 0–100,
-      "summary":   str  (1-2 sentence rationale)
-    }
-    """
     try:
         client = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
     except Exception:
         return _neutral_sentiment("ANTHROPIC_API_KEY not set in secrets.")
 
-    headlines_text = "\n".join(f"- {h}" for h in headlines) if headlines else "No recent headlines available."
+    headlines_text = (
+        "\n".join(f"- {h}" for h in headlines)
+        if headlines else "No recent headlines available."
+    )
 
     prompt = f"""You are a senior analyst specialising in Indian equity markets (NSE/BSE).
 
 Analyse the following data for {ticker_clean} (NSE) and return a JSON sentiment score.
 
-**Current price:** ₹{price:.2f}
-**Today's change:** {pct_change:+.2f}%
-**Recent news headlines:**
+Current price: Rs {price:.2f}
+Today's change: {pct_change:+.2f}%
+Recent news headlines:
 {headlines_text}
 
 Return ONLY valid JSON with these exact keys (no markdown, no explanation):
 {{
-  "score": <float between -1.0 (very bearish) and +1.0 (very bullish)>,
-  "label": "<Strongly Bullish | Bullish | Neutral | Bearish | Strongly Bearish>",
+  "score": <float between -1.0 and +1.0>,
+  "label": "<Strongly Bullish|Bullish|Neutral|Bearish|Strongly Bearish>",
   "confidence": <integer 0 to 100>,
-  "summary": "<1-2 sentence analyst rationale specific to Indian market context>"
-}}
-
-Consider:
-- News sentiment and relevance to Indian markets
-- Price momentum and change
-- Macro factors (RBI policy, FII/DII flows, Nifty trend) if inferable
-- Sector-specific Indian market dynamics"""
+  "summary": "<1-2 sentence rationale>"
+}}"""
 
     try:
         response = client.messages.create(
@@ -164,8 +214,7 @@ Consider:
         )
         raw  = response.content[0].text.strip()
         data = json.loads(raw.replace("```json", "").replace("```", "").strip())
-        # Clamp score
-        data["score"] = max(-1.0, min(1.0, float(data["score"])))
+        data["score"]      = max(-1.0, min(1.0, float(data["score"])))
         data["confidence"] = max(0, min(100, int(data["confidence"])))
         return data
     except json.JSONDecodeError:
@@ -174,70 +223,28 @@ Consider:
         return _neutral_sentiment(str(e))
 
 def _neutral_sentiment(reason: str = "") -> dict:
-    return {
-        "score":      0.0,
-        "label":      "Neutral",
-        "confidence": 0,
-        "summary":    reason or "Sentiment unavailable.",
-    }
-
-# ================= ENSEMBLE SCORER =================
-def strategy_score(df: pd.DataFrame) -> tuple[str, float]:
-    """Pure technical score — returns (signal_label, score in [-1,+1])."""
-    signals = [
-        macd_adx(df),
-        ema_rsi(df),
-        vwap_bounce(df),
-        supertrend(df),
-        bollinger(df),
-    ]
-    score = sum(signals) / len(signals)
-    if score > 0.4:
-        return "BUY", score
-    elif score < -0.4:
-        return "SELL", score
-    return "HOLD", score
-
-def combined_score(tech_score: float, sentiment: dict) -> tuple[str, float]:
-    """
-    Blend technical score with AI sentiment score.
-    combined = (1 - w) * tech + w * sentiment
-    where w = SENTIMENT_WEIGHT (default 0.30)
-    """
-    w   = SENTIMENT_WEIGHT
-    s   = sentiment.get("score", 0.0)
-    blended = (1 - w) * tech_score + w * s
-
-    if blended > 0.35:
-        label = "BUY"
-    elif blended < -0.35:
-        label = "SELL"
-    else:
-        label = "HOLD"
-
-    return label, round(blended, 3)
+    return {"score": 0.0, "label": "Neutral", "confidence": 0,
+            "summary": reason or "Sentiment unavailable."}
 
 # ================= BACKTEST =================
-def backtest(df: pd.DataFrame) -> tuple[float, list[float]]:
+def backtest(df: pd.DataFrame):
     capital  = CAPITAL
     position = 0.0
     entry    = 0.0
     trades   = []
 
-    for i in range(30, len(df) - 1):   # start after indicators warm up
-        slice_df         = df.iloc[: i + 1]
-        signal, _        = strategy_score(slice_df)
-        price            = float(df["Close"].iloc[i])
-        next_price       = float(df["Close"].iloc[i + 1])
-        atr              = float(df["atr"].iloc[i])
+    for i in range(30, len(df) - 1):
+        slice_df   = df.iloc[:i + 1]
+        signal, _  = strategy_score(slice_df)
+        price      = float(df["Close"].iloc[i])
+        next_price = float(df["Close"].iloc[i + 1])
+        atr        = float(df["atr"].iloc[i])
         if atr == 0:
             continue
-
         if signal == "BUY" and position == 0:
             qty      = (capital * RISK) / atr
             entry    = price
             position = qty
-
         elif position != 0:
             sl = entry - atr
             tp = entry + 2 * atr
@@ -251,136 +258,109 @@ def backtest(df: pd.DataFrame) -> tuple[float, list[float]]:
     return capital, trades
 
 # ================= METRICS =================
-def metrics(trades: list[float]) -> tuple[float, float, float]:
+def metrics(trades: list):
     if not trades:
         return 0.0, 0.0, 0.0
-    wins   = [t for t in trades if t > 0]
-    losses = [t for t in trades if t < 0]
+    wins     = [t for t in trades if t > 0]
+    losses   = [t for t in trades if t < 0]
     win_rate = len(wins) / len(trades)
     pf       = (sum(wins) / abs(sum(losses))) if losses else float("inf")
     avg_pnl  = sum(trades) / len(trades)
     return round(win_rate, 3), round(pf, 3), round(avg_pnl, 2)
 
-# ================= FULL SCANNER =================
-def scan(ticker: str, mode: str, use_sentiment: bool) -> dict | None:
+# ================= SCANNER =================
+def scan(ticker: str, mode: str, use_sentiment: bool):
     try:
         df = get_data(ticker, mode)
         if df is None or len(df) < 40:
             return None
         df = add_features(df)
+        if len(df) < 30:
+            return None
 
-        # Technical signal
         signal_tech, score_tech = strategy_score(df)
 
-        # Price info for sentiment
-        price       = float(df["Close"].iloc[-1])
-        prev_close  = float(df["Close"].iloc[-2]) if len(df) > 1 else price
-        pct_change  = ((price - prev_close) / prev_close) * 100
+        price      = float(df["Close"].iloc[-1])
+        prev_close = float(df["Close"].iloc[-2]) if len(df) > 1 else price
+        pct_change = ((price - prev_close) / prev_close) * 100
 
-        # Sentiment
         ticker_clean = ticker.replace(".NS", "")
         sentiment    = _neutral_sentiment()
 
         if use_sentiment:
-            headlines = get_news_headlines(ticker_clean)
+            headlines = tuple(get_news_headlines(ticker_clean))   # tuple for caching
             sentiment = get_ai_sentiment(ticker_clean, headlines, price, pct_change)
 
-        # Blended signal
         final_signal, final_score = combined_score(score_tech, sentiment)
-
-        # Backtest
-        final_cap, trades          = backtest(df)
-        win_rate, pf, avg_pnl      = metrics(trades)
+        final_cap, trades         = backtest(df)
+        win_rate, pf, avg_pnl     = metrics(trades)
 
         return {
-            "Stock":          ticker_clean,
-            "Price":          round(price, 2),
-            "Change%":        round(pct_change, 2),
-            # Technical
-            "Tech Signal":    signal_tech,
-            "Tech Score":     round(score_tech, 3),
-            # AI Sentiment
-            "Sentiment":      sentiment["label"],
-            "Sent Score":     round(sentiment["score"], 3),
-            "Sent Conf%":     sentiment["confidence"],
-            "AI Summary":     sentiment["summary"],
-            # Combined
-            "Final Signal":   final_signal,
-            "Final Score":    final_score,
-            # Backtest
-            "Win Rate":       win_rate,
-            "Profit Factor":  pf,
-            "Avg P&L (₹)":    avg_pnl,
-            "Final Capital":  int(final_cap),
-            "Total Trades":   len(trades),
+            "Stock":         ticker_clean,
+            "Price":         round(price, 2),
+            "Change%":       round(pct_change, 2),
+            "Tech Signal":   signal_tech,
+            "Tech Score":    round(score_tech, 3),
+            "Sentiment":     sentiment["label"],
+            "Sent Score":    round(sentiment["score"], 3),
+            "Sent Conf%":    sentiment["confidence"],
+            "AI Summary":    sentiment["summary"],
+            "Final Signal":  final_signal,
+            "Final Score":   final_score,
+            "Win Rate":      win_rate,
+            "Profit Factor": pf,
+            "Avg P&L (Rs)":  avg_pnl,
+            "Final Capital": int(final_cap),
+            "Total Trades":  len(trades),
         }
     except Exception as e:
         st.warning(f"Error scanning {ticker}: {e}")
         return None
 
-# ================= SIGNAL COLOUR HELPERS =================
-def _colour_signal(val: str) -> str:
-    if val == "BUY":
-        return "background-color:#1a4731;color:#00e5a0;font-weight:600;"
-    if val == "SELL":
-        return "background-color:#4a1020;color:#ff4d6d;font-weight:600;"
-    return "color:#f5b731;"
+# ================= STYLE =================
+def _colour_signal(val):
+    if val == "BUY":  return "background-color:#1a4731;color:#00c853;font-weight:600;"
+    if val == "SELL": return "background-color:#4a1020;color:#ff5252;font-weight:600;"
+    return "color:#ffc107;"
 
-def _colour_sent(val: str) -> str:
-    if "Bullish" in val:
-        return "color:#00e5a0;"
-    if "Bearish" in val:
-        return "color:#ff4d6d;"
-    return "color:#f5b731;"
+def _colour_sent(val):
+    if "Bullish" in str(val): return "color:#00c853;"
+    if "Bearish" in str(val): return "color:#ff5252;"
+    return "color:#ffc107;"
 
 # ================= UI =================
 with st.sidebar:
-    st.header("⚙️ Settings")
+    st.header("Settings")
     mode          = st.selectbox("Trading Mode", ["Swing", "Intraday"])
-    use_sentiment = st.toggle("🤖 Enable AI Sentiment", value=True,
-                              help="Uses Claude to analyse news headlines and price action")
-    sent_weight   = st.slider("Sentiment Weight in Score", 0.0, 0.8, SENTIMENT_WEIGHT, 0.05,
-                              help="How much AI sentiment influences the final signal")
+    use_sentiment = st.toggle("Enable AI Sentiment", value=True)
+    sent_weight   = st.slider("Sentiment Weight in Score", 0.0, 0.8, SENTIMENT_WEIGHT, 0.05)
     SENTIMENT_WEIGHT = sent_weight
-
     st.divider()
-    st.caption("**Signal thresholds**")
-    st.caption("BUY  → blended score > 0.35")
-    st.caption("SELL → blended score < -0.35")
-    st.caption("HOLD → everything else")
+    st.caption("Signal thresholds")
+    st.caption("BUY  -> blended score > 0.35")
+    st.caption("SELL -> blended score < -0.35")
+    st.caption("HOLD -> everything else")
     st.divider()
-    auto = st.checkbox("⏱️ Auto Refresh (5 min)")
-    st.caption("Sentiment cached 30 min | Data cached 5 min")
+    auto = st.checkbox("Auto Refresh (5 min)")
 
-# ── Main area ──────────────────────────────────────────────────
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("Capital",          f"₹{CAPITAL:,}")
-col2.metric("Risk/Trade",       f"{RISK*100:.0f}%")
-col3.metric("Sentiment Weight", f"{SENTIMENT_WEIGHT*100:.0f}%")
+col1.metric("Capital",           f"Rs {CAPITAL:,}")
+col2.metric("Risk/Trade",        f"{RISK*100:.0f}%")
+col3.metric("Sentiment Weight",  f"{SENTIMENT_WEIGHT*100:.0f}%")
 col4.metric("Stocks in Scanner", str(len(NIFTY50)))
 
 st.divider()
 
-# ── HOW IT WORKS expander ─────────────────────────────────────
-with st.expander("ℹ️ How AI Sentiment is Integrated", expanded=False):
+with st.expander("How AI Sentiment is Integrated", expanded=False):
     st.markdown(f"""
-**Pipeline for each stock:**
-
-1. **Technical Score** — average of 5 strategies (MACD+ADX, EMA+RSI, VWAP, SuperTrend, Bollinger) → range **[-1, +1]**
-2. **AI Sentiment Score** — Claude analyses:
-   - Up to 8 recent Yahoo Finance news headlines
-   - Current price and today's % change
-   - Indian market context (RBI, FII/DII, sector dynamics)
-   → returns score in **[-1, +1]** with confidence %
-3. **Blended Score** = `(1 - {SENTIMENT_WEIGHT:.0%}) × tech_score + {SENTIMENT_WEIGHT:.0%} × sentiment_score`
-4. **Final Signal**: BUY if > 0.35 · SELL if < -0.35 · HOLD otherwise
-5. **Telegram alert** sent for strong BUY signals (score > 0.6)
-
-> Sentiment is cached 30 min per ticker. Technical data is cached 5 min.
+**Pipeline per stock:**
+1. **Technical Score** — avg of 5 strategies -> `[-1, +1]`
+2. **AI Sentiment** — Claude analyses news + price action -> `[-1, +1]`
+3. **Blended Score** = `(1 - {SENTIMENT_WEIGHT:.0%}) x tech + {SENTIMENT_WEIGHT:.0%} x sentiment`
+4. **Signal**: BUY > 0.35 | SELL < -0.35 | HOLD otherwise
 """)
 
-# ── RUN BUTTON ────────────────────────────────────────────────
-if st.button("▶ Run Scanner", type="primary", use_container_width=True):
+if st.button("Run Scanner", type="primary", use_container_width=True):
 
     results     = []
     progress    = st.progress(0, text="Scanning stocks...")
@@ -389,20 +369,18 @@ if st.button("▶ Run Scanner", type="primary", use_container_width=True):
     for i, stock in enumerate(NIFTY50):
         pct = (i + 1) / len(NIFTY50)
         progress.progress(pct, text=f"Scanning {stock} ({i+1}/{len(NIFTY50)})...")
-
         if use_sentiment:
-            status_area.info(f"🤖 Getting AI sentiment for {stock}...")
+            status_area.info(f"Getting AI sentiment for {stock}...")
 
         res = scan(stock, mode, use_sentiment)
         if res:
             results.append(res)
-
-            # Telegram alert for strong combined BUY
             if res["Final Signal"] == "BUY" and res["Final Score"] > 0.6:
-                sent_str = f" | Sentiment: {res['Sentiment']} ({res['Sent Conf%']}%)" if use_sentiment else ""
+                sent_str = (f" | Sentiment: {res['Sentiment']} ({res['Sent Conf%']}%)"
+                            if use_sentiment else "")
                 send_telegram(
-                    f"🚀 BUY {res['Stock']}\n"
-                    f"Price: ₹{res['Price']} ({res['Change%']:+.2f}%)\n"
+                    f"BUY SIGNAL: {res['Stock']}\n"
+                    f"Price: Rs {res['Price']} ({res['Change%']:+.2f}%)\n"
                     f"Score: {res['Final Score']}{sent_str}\n"
                     f"Win Rate: {res['Win Rate']*100:.0f}% | PF: {res['Profit Factor']:.2f}\n"
                     f"AI: {res['AI Summary']}"
@@ -412,30 +390,28 @@ if st.button("▶ Run Scanner", type="primary", use_container_width=True):
     status_area.empty()
 
     if not results:
-        st.error("No results returned. Check your data connection.")
+        st.error("No results returned. Check your internet connection or try again.")
         st.stop()
 
     df_results = pd.DataFrame(results).sort_values("Final Score", ascending=False)
 
-    # ── SUMMARY METRICS ────────────────────────────────────────
-    buys  = (df_results["Final Signal"] == "BUY").sum()
-    sells = (df_results["Final Signal"] == "SELL").sum()
-    holds = (df_results["Final Signal"] == "HOLD").sum()
+    buys   = (df_results["Final Signal"] == "BUY").sum()
+    sells  = (df_results["Final Signal"] == "SELL").sum()
+    holds  = (df_results["Final Signal"] == "HOLD").sum()
     avg_wr = df_results["Win Rate"].mean() * 100
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("🟢 BUY Signals",  buys)
-    c2.metric("🔴 SELL Signals", sells)
-    c3.metric("🟡 HOLD Signals", holds)
-    c4.metric("📊 Avg Win Rate", f"{avg_wr:.1f}%")
+    c1.metric("BUY Signals",  buys)
+    c2.metric("SELL Signals", sells)
+    c3.metric("HOLD Signals", holds)
+    c4.metric("Avg Win Rate", f"{avg_wr:.1f}%")
 
     st.divider()
 
-    # ── TABS ───────────────────────────────────────────────────
-    tab1, tab2, tab3 = st.tabs(["📋 Signal Table", "🤖 AI Sentiment Detail", "📈 Backtest Summary"])
+    tab1, tab2, tab3 = st.tabs(["Signal Table", "AI Sentiment Detail", "Backtest Summary"])
 
     with tab1:
-        st.subheader("All Signals — Sorted by Final Score")
+        st.subheader("All Signals - Sorted by Final Score")
         display_cols = [
             "Stock","Price","Change%",
             "Tech Signal","Tech Score",
@@ -448,29 +424,26 @@ if st.button("▶ Run Scanner", type="primary", use_container_width=True):
         def style_row(row):
             styles = [""] * len(row)
             for j, col in enumerate(row.index):
-                if col == "Final Signal":
-                    styles[j] = _colour_signal(row[col])
-                elif col == "Tech Signal":
+                if col in ("Final Signal", "Tech Signal"):
                     styles[j] = _colour_signal(row[col])
                 elif col == "Sentiment":
                     styles[j] = _colour_sent(row[col])
                 elif col == "Change%":
-                    styles[j] = "color:#00e5a0;" if row[col] > 0 else "color:#ff4d6d;"
+                    styles[j] = "color:#00c853;" if row[col] > 0 else "color:#ff5252;"
             return styles
 
         st.dataframe(
             disp.style.apply(style_row, axis=1).format({
-                "Price":          "₹{:.2f}",
-                "Change%":        "{:+.2f}%",
-                "Tech Score":     "{:.3f}",
-                "Sent Score":     "{:.3f}",
-                "Sent Conf%":     "{:.0f}%",
-                "Final Score":    "{:.3f}",
-                "Win Rate":       "{:.1%}",
-                "Profit Factor":  "{:.2f}",
+                "Price":         "Rs {:.2f}",
+                "Change%":       "{:+.2f}%",
+                "Tech Score":    "{:.3f}",
+                "Sent Score":    "{:.3f}",
+                "Sent Conf%":    "{:.0f}%",
+                "Final Score":   "{:.3f}",
+                "Win Rate":      "{:.1%}",
+                "Profit Factor": "{:.2f}",
             }),
-            use_container_width=True,
-            height=420,
+            use_container_width=True, height=420,
         )
 
     with tab2:
@@ -479,45 +452,35 @@ if st.button("▶ Run Scanner", type="primary", use_container_width=True):
             st.info("Enable AI Sentiment in the sidebar to see this panel.")
         else:
             for _, row in df_results.iterrows():
-                signal_col = (
-                    "🟢" if row["Final Signal"] == "BUY"
-                    else "🔴" if row["Final Signal"] == "SELL"
-                    else "🟡"
-                )
+                icon = "BUY" if row["Final Signal"]=="BUY" else "SELL" if row["Final Signal"]=="SELL" else "HOLD"
                 with st.expander(
-                    f"{signal_col} **{row['Stock']}** — {row['Sentiment']} "
+                    f"[{icon}] {row['Stock']} | {row['Sentiment']} "
                     f"(Sent: {row['Sent Score']:+.2f} | Conf: {row['Sent Conf%']}%) "
-                    f"| Final: {row['Final Signal']} ({row['Final Score']:+.3f})"
+                    f"| Final Score: {row['Final Score']:+.3f}"
                 ):
                     c1, c2, c3 = st.columns(3)
                     c1.metric("Technical Score", f"{row['Tech Score']:+.3f}", row["Tech Signal"])
                     c2.metric("Sentiment Score", f"{row['Sent Score']:+.3f}", row["Sentiment"])
                     c3.metric("Blended Score",   f"{row['Final Score']:+.3f}", row["Final Signal"])
-                    st.info(f"🤖 **AI Analysis:** {row['AI Summary']}")
+                    st.info(f"AI Analysis: {row['AI Summary']}")
 
     with tab3:
         st.subheader("Backtest Performance")
-        bt_cols = ["Stock","Final Signal","Win Rate","Profit Factor","Avg P&L (₹)","Final Capital","Total Trades"]
-        bt_df   = df_results[bt_cols].copy()
+        bt_cols = ["Stock","Final Signal","Win Rate","Profit Factor","Avg P&L (Rs)","Final Capital","Total Trades"]
         st.dataframe(
-            bt_df.style.format({
+            df_results[bt_cols].style.format({
                 "Win Rate":      "{:.1%}",
                 "Profit Factor": "{:.2f}",
-                "Avg P&L (₹)":   "₹{:.2f}",
-                "Final Capital": "₹{:,}",
+                "Avg P&L (Rs)":  "Rs {:.2f}",
+                "Final Capital": "Rs {:,}",
             }),
-            use_container_width=True,
-            height=400,
+            use_container_width=True, height=400,
         )
-
-        # Summary bars
         st.divider()
-        st.markdown("**Capital outcome distribution**")
-        bt_chart = df_results[["Stock","Final Capital"]].set_index("Stock")
-        st.bar_chart(bt_chart)
+        st.markdown("**Capital outcome by stock**")
+        st.bar_chart(df_results[["Stock","Final Capital"]].set_index("Stock"))
 
-# ── AUTO REFRESH ──────────────────────────────────────────────
 if auto:
-    st.toast("Auto-refreshing in 5 minutes…")
+    st.toast("Auto-refreshing in 5 minutes...")
     time.sleep(300)
     st.rerun()

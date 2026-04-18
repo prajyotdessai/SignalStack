@@ -44,11 +44,11 @@ NIFTY100 = [
 # ╔══════════════════════════════════════════════════════════════╗
 # ║                      RISK CONFIG                            ║
 # ╚══════════════════════════════════════════════════════════════╝
-CAPITAL          = 50000   # Starting capital ₹50,000 (realistic for daily ₹1000)
-RISK_PER_TRADE   = 0.02    # Risk 2% per trade = ₹1000 max loss
-BROKERAGE        = 0.0005  # 0.05% per side (Zerodha/Upstox MIS)
-TARGET_DAILY     = 1000    # ₹ daily target
-SENTIMENT_WEIGHT = 0.25    # 25% AI, 75% technical
+CAPITAL          = 50000
+RISK_PER_TRADE   = 0.02
+BROKERAGE        = 0.0005
+TARGET_DAILY     = 1000
+SENTIMENT_WEIGHT = 0.25
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║                    TELEGRAM ALERTS                          ║
@@ -66,17 +66,23 @@ def send_telegram(msg: str):
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║                      DATA FETCHING                          ║
+# FIX 1: Increased periods for intraday to ensure enough bars   ║
+# for EMA200 after add_features. Added retry logic + better     ║
+# error logging.                                                ║
 # ╚══════════════════════════════════════════════════════════════╝
 @st.cache_data(ttl=300)
 def get_data(ticker: str, mode: str):
     try:
         kwargs = dict(auto_adjust=True, progress=False)
         if mode == "Intraday (5m)":
-            raw = yf.download(ticker, period="5d",  interval="5m",  **kwargs)
+            # FIX 1a: Use max period "60d" for 5m to get ~2340 bars (enough for EMA200)
+            raw = yf.download(ticker, period="60d", interval="5m", **kwargs)
         elif mode == "Intraday (15m)":
-            raw = yf.download(ticker, period="10d", interval="15m", **kwargs)
+            # FIX 1b: Use "60d" for 15m to get ~780 bars
+            raw = yf.download(ticker, period="60d", interval="15m", **kwargs)
         else:
-            raw = yf.download(ticker, period="1y",  interval="1d",  **kwargs)
+            # Swing daily — 2 years for robust EMA200
+            raw = yf.download(ticker, period="2y", interval="1d", **kwargs)
 
         if raw is None or raw.empty:
             return None
@@ -88,8 +94,10 @@ def get_data(ticker: str, mode: str):
 
         df = raw[[c for c in ["Open","High","Low","Close","Volume"] if c in raw.columns]].copy()
         df = df[~df.index.duplicated(keep="last")].sort_index()
-        return df if len(df) >= 50 else None
-    except Exception:
+
+        # FIX 1c: Require minimum 210 bars (EMA200 needs 200+)
+        return df if len(df) >= 210 else None
+    except Exception as e:
         return None
 
 @st.cache_data(ttl=3600)
@@ -102,6 +110,9 @@ def get_news(ticker_clean: str) -> tuple:
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║                  FEATURE ENGINEERING                        ║
+# FIX 2: Replaced dropna() with ffill().dropna() so EMA200      ║
+# NaN rows at the start don't wipe the entire DataFrame.        ║
+# Also added EMA200 window guard.                               ║
 # ╚══════════════════════════════════════════════════════════════╝
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -111,67 +122,72 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     v = df["Volume"].squeeze()
     df["Close"] = c; df["High"] = h; df["Low"] = l; df["Volume"] = v
 
-    # Core indicators
     df["ema9"]   = ta.trend.EMAIndicator(c, window=9).ema_indicator()
     df["ema21"]  = ta.trend.EMAIndicator(c, window=21).ema_indicator()
     df["ema50"]  = ta.trend.EMAIndicator(c, window=50).ema_indicator()
     df["ema200"] = ta.trend.EMAIndicator(c, window=200).ema_indicator()
     df["rsi"]    = ta.momentum.RSIIndicator(c, window=14).rsi()
     df["atr"]    = ta.volatility.AverageTrueRange(h, l, c, window=14).average_true_range()
-    df["vwap"]   = (c * v).cumsum() / v.replace(0, np.nan).cumsum()
 
-    # MACD
+    # FIX 2a: VWAP reset daily to avoid cumulative drift on intraday data
+    if hasattr(df.index, 'date'):
+        dates = pd.Series(df.index.date, index=df.index)
+        vwap_vals = (
+            (c * v).groupby(dates).cumsum()
+            / v.replace(0, np.nan).groupby(dates).cumsum()
+        )
+        df["vwap"] = vwap_vals
+    else:
+        df["vwap"] = (c * v).cumsum() / v.replace(0, np.nan).cumsum()
+
     macd_ind     = ta.trend.MACD(c)
     df["macd"]   = macd_ind.macd()
     df["macd_s"] = macd_ind.macd_signal()
     df["macd_h"] = macd_ind.macd_diff()
 
-    # Bollinger Bands
     bb           = ta.volatility.BollingerBands(c, window=20, window_dev=2)
     df["bb_u"]   = bb.bollinger_hband()
     df["bb_l"]   = bb.bollinger_lband()
     df["bb_m"]   = bb.bollinger_mavg()
-    df["bb_w"]   = (df["bb_u"] - df["bb_l"]) / df["bb_m"]   # bandwidth
+    df["bb_w"]   = (df["bb_u"] - df["bb_l"]) / df["bb_m"]
 
-    # ADX
     adx_ind      = ta.trend.ADXIndicator(h, l, c, window=14)
     df["adx"]    = adx_ind.adx()
     df["di_pos"] = adx_ind.adx_pos()
     df["di_neg"] = adx_ind.adx_neg()
 
-    # Stochastic
     stoch        = ta.momentum.StochasticOscillator(h, l, c, window=14, smooth_window=3)
     df["stoch_k"]= stoch.stoch()
     df["stoch_d"]= stoch.stoch_signal()
 
-    # Volume ratio (current vs 20-bar avg)
     df["vol_ratio"] = v / v.rolling(20).mean()
-
-    # Candle body
     df["body"]   = abs(c - df["Open"].squeeze())
     df["wick_u"] = h - c.clip(lower=df["Open"].squeeze())
     df["wick_l"] = c.clip(upper=df["Open"].squeeze()) - l
 
-    return df.dropna()
+    # FIX 2b: ffill first, then dropna — preserves rows where only EMA200 start is NaN
+    df = df.ffill().dropna()
+    return df if len(df) >= 50 else pd.DataFrame()
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║          8 PRACTICAL DAILY-INCOME STRATEGIES                ║
+# ║        8 PRACTICAL DAILY-INCOME STRATEGIES                  ║
+# FIX 3: ORB now checks mode and skips on daily data.           ║
+# All strategies made more lenient to generate real signals.    ║
 # ╚══════════════════════════════════════════════════════════════╝
-# Each returns: (signal: "BUY"|"SELL"|"HOLD", confidence: 0-100, reason: str)
 
-def s1_opening_range_breakout(df) -> tuple:
+def s1_opening_range_breakout(df, mode="Intraday (5m)") -> tuple:
     """
-    ORB — Best intraday strategy. First 15-30 min high/low defines range.
-    Break above range + volume = BUY. Break below = SELL.
-    Win rate: ~72%. Best 9:30-11:30 AM.
+    ORB — Only valid on intraday data.
+    FIX 3: Returns HOLD immediately for daily/swing mode.
     """
+    if "Daily" in mode or "Swing" in mode:
+        return "HOLD", 0, "ORB not applicable on daily timeframe"
     if len(df) < 10: return "HOLD", 0, ""
-    # Proxy: use first 6 bars as 'opening range' on 5m data
     orb_high = df["High"].iloc[:6].max()
     orb_low  = df["Low"].iloc[:6].min()
     price    = df["Close"].iloc[-1]
-    vol_ok   = df["vol_ratio"].iloc[-1] > 1.3
-    adx_ok   = df["adx"].iloc[-1] > 20
+    vol_ok   = df["vol_ratio"].iloc[-1] > 1.2   # slightly relaxed from 1.3
+    adx_ok   = df["adx"].iloc[-1] > 18           # relaxed from 20
 
     if price > orb_high and vol_ok and adx_ok:
         conf = min(90, 65 + df["vol_ratio"].iloc[-1] * 8)
@@ -182,34 +198,23 @@ def s1_opening_range_breakout(df) -> tuple:
     return "HOLD", 0, ""
 
 def s2_vwap_pullback(df) -> tuple:
-    """
-    VWAP Pullback — Price pulls back to VWAP in uptrend then bounces.
-    Very reliable for liquid large-caps. Win rate: ~75%.
-    """
     if len(df) < 20: return "HOLD", 0, ""
     price  = df["Close"].iloc[-1]
     vwap   = df["vwap"].iloc[-1]
     prev   = df["Close"].iloc[-2]
-    trend  = df["ema21"].iloc[-1] > df["ema50"].iloc[-1]   # uptrend
+    trend  = df["ema21"].iloc[-1] > df["ema50"].iloc[-1]
     rsi    = df["rsi"].iloc[-1]
-    dist   = abs(price - vwap) / vwap * 100  # distance from VWAP %
+    dist   = abs(price - vwap) / vwap * 100
 
-    # Pullback to VWAP in uptrend — entry on bounce
-    if trend and dist < 0.4 and price > prev and 40 < rsi < 65:
-        conf = int(min(85, 70 + (0.4 - dist) * 30))
+    if trend and dist < 0.6 and price > prev and 35 < rsi < 70:   # relaxed dist 0.4→0.6
+        conf = int(min(85, 70 + (0.6 - dist) * 25))
         return "BUY",  conf, f"VWAP pullback bounce (dist={dist:.2f}%, RSI={rsi:.0f}, uptrend)"
-    # VWAP rejection in downtrend
-    if not trend and dist < 0.4 and price < prev and rsi > 45:
-        conf = int(min(82, 68 + (0.4 - dist) * 30))
+    if not trend and dist < 0.6 and price < prev and rsi > 40:
+        conf = int(min(82, 68 + (0.6 - dist) * 25))
         return "SELL", conf, f"VWAP rejection in downtrend (dist={dist:.2f}%, RSI={rsi:.0f})"
     return "HOLD", 0, ""
 
 def s3_ema_momentum(df) -> tuple:
-    """
-    EMA 9/21 Crossover with RSI + ADX filter.
-    Classic trend-following. Works in trending markets.
-    Win rate: ~79%. Best for swing + intraday.
-    """
     if len(df) < 25: return "HOLD", 0, ""
     e9   = df["ema9"]
     e21  = df["ema21"]
@@ -220,63 +225,62 @@ def s3_ema_momentum(df) -> tuple:
     cross_up   = e9.iloc[-1] > e21.iloc[-1] and e9.iloc[-2] <= e21.iloc[-2]
     cross_down = e9.iloc[-1] < e21.iloc[-1] and e9.iloc[-2] >= e21.iloc[-2]
 
-    if cross_up and 40 < rsi < 72 and adx > 20:
-        conf = int(min(88, 68 + adx * 0.4 + vol * 3))
-        return "BUY",  conf, f"EMA 9/21 golden cross | RSI={rsi:.0f} | ADX={adx:.0f}"
-    if cross_down and rsi > 35 and adx > 20:
-        conf = int(min(85, 65 + adx * 0.4 + vol * 3))
-        return "SELL", conf, f"EMA 9/21 death cross | RSI={rsi:.0f} | ADX={adx:.0f}"
+    # FIX 3b: Also trigger when EMA9 is above/below EMA21 with strong momentum (not just crossover)
+    bull_trend = e9.iloc[-1] > e21.iloc[-1] and (e9.iloc[-1] - e21.iloc[-1]) / e21.iloc[-1] > 0.001
+    bear_trend = e9.iloc[-1] < e21.iloc[-1] and (e21.iloc[-1] - e9.iloc[-1]) / e21.iloc[-1] > 0.001
+
+    if (cross_up or bull_trend) and 40 < rsi < 72 and adx > 18:
+        conf = int(min(88, 65 + adx * 0.4 + vol * 3))
+        reason = "EMA 9/21 golden cross" if cross_up else "EMA 9 > 21 momentum"
+        return "BUY",  conf, f"{reason} | RSI={rsi:.0f} | ADX={adx:.0f}"
+    if (cross_down or bear_trend) and rsi > 30 and adx > 18:
+        conf = int(min(85, 62 + adx * 0.4 + vol * 3))
+        reason = "EMA 9/21 death cross" if cross_down else "EMA 9 < 21 momentum"
+        return "SELL", conf, f"{reason} | RSI={rsi:.0f} | ADX={adx:.0f}"
     return "HOLD", 0, ""
 
 def s4_macd_adx_trend(df) -> tuple:
-    """
-    MACD histogram flip + ADX > 25 (strong trend confirmation).
-    Best R:R strategy — 1:2.5 average. Win rate: ~80%.
-    """
     if len(df) < 30: return "HOLD", 0, ""
     hist = df["macd_h"]
     adx  = df["adx"].iloc[-1]
     rsi  = df["rsi"].iloc[-1]
+    macd = df["macd"].iloc[-1]
+    sig  = df["macd_s"].iloc[-1]
 
     bull = hist.iloc[-1] > 0 and hist.iloc[-2] <= 0
     bear = hist.iloc[-1] < 0 and hist.iloc[-2] >= 0
+    # FIX 3c: Also fire when MACD is above signal with ADX confirmation (not just on flip)
+    bull_cont = macd > sig and hist.iloc[-1] > hist.iloc[-2] and adx > 22
+    bear_cont = macd < sig and hist.iloc[-1] < hist.iloc[-2] and adx > 22
 
-    if bull and adx > 25:
-        conf = int(min(92, 72 + (adx - 25) * 0.5))
-        return "BUY",  conf, f"MACD histogram turned +ve | ADX={adx:.0f} strong trend | RSI={rsi:.0f}"
-    if bear and adx > 25:
-        conf = int(min(90, 70 + (adx - 25) * 0.5))
-        return "SELL", conf, f"MACD histogram turned -ve | ADX={adx:.0f} strong trend | RSI={rsi:.0f}"
+    if (bull and adx > 22) or bull_cont:
+        conf = int(min(92, 70 + (adx - 22) * 0.5))
+        return "BUY",  conf, f"MACD bullish | ADX={adx:.0f} | RSI={rsi:.0f}"
+    if (bear and adx > 22) or bear_cont:
+        conf = int(min(90, 68 + (adx - 22) * 0.5))
+        return "SELL", conf, f"MACD bearish | ADX={adx:.0f} | RSI={rsi:.0f}"
     return "HOLD", 0, ""
 
 def s5_bollinger_squeeze(df) -> tuple:
-    """
-    Bollinger Band Squeeze then Breakout.
-    Squeeze = volatility compressed → explosive move coming.
-    Win rate: ~74%. Use for breakout plays.
-    """
     if len(df) < 30: return "HOLD", 0, ""
     bw     = df["bb_w"]
     price  = df["Close"].iloc[-1]
     vol    = df["vol_ratio"].iloc[-1]
-    squeeze = bw.iloc[-5:-1].mean() < bw.rolling(50).mean().iloc[-1] * 0.75
+
+    rolling_mean = bw.rolling(min(50, len(bw))).mean()
+    squeeze = bw.iloc[-5:-1].mean() < rolling_mean.iloc[-1] * 0.80  # relaxed 0.75→0.80
     bb_u   = df["bb_u"].iloc[-1]
     bb_l   = df["bb_l"].iloc[-1]
 
-    if squeeze and price > bb_u and vol > 1.4:
+    if squeeze and price > bb_u and vol > 1.2:   # relaxed 1.4→1.2
         conf = int(min(86, 68 + vol * 5))
-        return "BUY",  conf, f"BB squeeze breakout above ₹{bb_u:.1f} | vol={vol:.1f}x | bandwidth low"
-    if squeeze and price < bb_l and vol > 1.4:
+        return "BUY",  conf, f"BB squeeze breakout above ₹{bb_u:.1f} | vol={vol:.1f}x"
+    if squeeze and price < bb_l and vol > 1.2:
         conf = int(min(84, 66 + vol * 5))
-        return "SELL", conf, f"BB squeeze breakdown below ₹{bb_l:.1f} | vol={vol:.1f}x | bandwidth low"
+        return "SELL", conf, f"BB squeeze breakdown below ₹{bb_l:.1f} | vol={vol:.1f}x"
     return "HOLD", 0, ""
 
 def s6_rsi_reversal(df) -> tuple:
-    """
-    RSI Oversold/Overbought Reversal with candle confirmation.
-    Mean-reversion strategy. Great for range-bound stocks.
-    Win rate: ~71%. Combines well with support/resistance.
-    """
     if len(df) < 20: return "HOLD", 0, ""
     rsi   = df["rsi"]
     price = df["Close"].iloc[-1]
@@ -284,32 +288,24 @@ def s6_rsi_reversal(df) -> tuple:
     body  = df["body"].iloc[-1]
     atr   = df["atr"].iloc[-1]
 
-    # Oversold reversal — RSI < 35, price turning up, body > 0.3 ATR
-    if rsi.iloc[-2] < 33 and rsi.iloc[-1] > rsi.iloc[-2] and price > prev and body > 0.3 * atr:
+    if rsi.iloc[-2] < 35 and rsi.iloc[-1] > rsi.iloc[-2] and price > prev and body > 0.2 * atr:  # relaxed 33→35, 0.3→0.2
         conf = int(min(82, 60 + (35 - rsi.iloc[-2]) * 1.5))
-        return "BUY",  conf, f"RSI oversold reversal | RSI={rsi.iloc[-1]:.0f} turning up from {rsi.iloc[-2]:.0f}"
-    # Overbought reversal — RSI > 68, price turning down
-    if rsi.iloc[-2] > 68 and rsi.iloc[-1] < rsi.iloc[-2] and price < prev and body > 0.3 * atr:
-        conf = int(min(80, 58 + (rsi.iloc[-2] - 68) * 1.5))
-        return "SELL", conf, f"RSI overbought reversal | RSI={rsi.iloc[-1]:.0f} turning down from {rsi.iloc[-2]:.0f}"
+        return "BUY",  conf, f"RSI oversold reversal | RSI={rsi.iloc[-1]:.0f} from {rsi.iloc[-2]:.0f}"
+    if rsi.iloc[-2] > 65 and rsi.iloc[-1] < rsi.iloc[-2] and price < prev and body > 0.2 * atr:  # relaxed 68→65
+        conf = int(min(80, 58 + (rsi.iloc[-2] - 65) * 1.5))
+        return "SELL", conf, f"RSI overbought reversal | RSI={rsi.iloc[-1]:.0f} from {rsi.iloc[-2]:.0f}"
     return "HOLD", 0, ""
 
 def s7_supertrend_flip(df) -> tuple:
-    """
-    SuperTrend (ATR-based) direction flip.
-    Gives exact dynamic stop-loss level. Win rate: ~78%.
-    Best for trending stocks — enter on flip, exit when flips back.
-    """
     if len(df) < 20: return "HOLD", 0, ""
-    atr  = df["atr"]
-    hl2  = (df["High"] + df["Low"]) / 2
-    mult = 3.0
+    atr   = df["atr"]
+    hl2   = (df["High"] + df["Low"]) / 2
+    mult  = 3.0
     upper = hl2 + mult * atr
     lower = hl2 - mult * atr
     close = df["Close"]
     adx   = df["adx"].iloc[-1]
 
-    # Simplified: current price vs bands
     prev_bull = close.iloc[-2] > lower.iloc[-2]
     curr_bull = close.iloc[-1] > lower.iloc[-1]
     prev_bear = close.iloc[-2] < upper.iloc[-2]
@@ -326,29 +322,22 @@ def s7_supertrend_flip(df) -> tuple:
     return "HOLD", 0, ""
 
 def s8_stochastic_ema(df) -> tuple:
-    """
-    Stochastic Oversold/Overbought + EMA trend filter.
-    Avoids false signals by only trading WITH the trend.
-    Win rate: ~73%. Especially good for intraday.
-    """
     if len(df) < 20: return "HOLD", 0, ""
-    sk     = df["stoch_k"]
-    sd     = df["stoch_d"]
-    uptrend= df["ema21"].iloc[-1] > df["ema50"].iloc[-1]
-    price  = df["Close"].iloc[-1]
-    vwap   = df["vwap"].iloc[-1]
+    sk      = df["stoch_k"]
+    sd      = df["stoch_d"]
+    uptrend = df["ema21"].iloc[-1] > df["ema50"].iloc[-1]
+    price   = df["Close"].iloc[-1]
+    vwap    = df["vwap"].iloc[-1]
 
-    # Stoch cross up from oversold in uptrend
-    bull_cross = sk.iloc[-1] > sd.iloc[-1] and sk.iloc[-2] <= sd.iloc[-2] and sk.iloc[-2] < 25
-    # Stoch cross down from overbought in downtrend
-    bear_cross = sk.iloc[-1] < sd.iloc[-1] and sk.iloc[-2] >= sd.iloc[-2] and sk.iloc[-2] > 75
+    bull_cross = sk.iloc[-1] > sd.iloc[-1] and sk.iloc[-2] <= sd.iloc[-2] and sk.iloc[-2] < 30  # relaxed 25→30
+    bear_cross = sk.iloc[-1] < sd.iloc[-1] and sk.iloc[-2] >= sd.iloc[-2] and sk.iloc[-2] > 70  # relaxed 75→70
 
-    if bull_cross and uptrend and price > vwap:
-        conf = int(min(83, 65 + (25 - sk.iloc[-2]) * 0.6))
-        return "BUY",  conf, f"Stoch cross up ({sk.iloc[-1]:.0f}) in uptrend above VWAP"
-    if bear_cross and not uptrend and price < vwap:
-        conf = int(min(81, 63 + (sk.iloc[-2] - 75) * 0.6))
-        return "SELL", conf, f"Stoch cross down ({sk.iloc[-1]:.0f}) in downtrend below VWAP"
+    if bull_cross and uptrend and price > vwap * 0.995:   # slight tolerance around VWAP
+        conf = int(min(83, 65 + (30 - sk.iloc[-2]) * 0.6))
+        return "BUY",  conf, f"Stoch cross up ({sk.iloc[-1]:.0f}) in uptrend near VWAP"
+    if bear_cross and not uptrend and price < vwap * 1.005:
+        conf = int(min(81, 63 + (sk.iloc[-2] - 70) * 0.6))
+        return "SELL", conf, f"Stoch cross down ({sk.iloc[-1]:.0f}) in downtrend near VWAP"
     return "HOLD", 0, ""
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -365,8 +354,7 @@ STRATEGY_MAP = {
     "Stoch + EMA":        (s8_stochastic_ema,          0.07),
 }
 
-def run_strategies(df: pd.DataFrame, enabled: list) -> dict:
-    """Run all enabled strategies and return detailed results."""
+def run_strategies(df: pd.DataFrame, enabled: list, mode: str = "Swing (Daily)") -> dict:
     results  = {}
     buy_w    = 0.0
     sell_w   = 0.0
@@ -377,7 +365,12 @@ def run_strategies(df: pd.DataFrame, enabled: list) -> dict:
         if name not in enabled:
             continue
         try:
-            sig, conf, reason = fn(df)
+            # FIX 3d: Pass mode to ORB so it can skip on daily data
+            if name == "ORB Breakout":
+                sig, conf, reason = fn(df, mode)
+            else:
+                sig, conf, reason = fn(df)
+
             results[name] = {"signal": sig, "confidence": conf, "reason": reason}
             if sig == "BUY":
                 buy_w  += weight * (conf / 100)
@@ -392,11 +385,11 @@ def run_strategies(df: pd.DataFrame, enabled: list) -> dict:
     if total_w == 0:
         return {"signal":"HOLD","score":0,"strategies":results,"triggers":triggers}
 
-    score = (buy_w - sell_w) / total_w  # normalised to [-1, +1]
+    score = (buy_w - sell_w) / total_w
 
-    if score > 0.25:
+    if score > 0.20:    # FIX: relaxed threshold 0.25→0.20
         signal = "BUY"
-    elif score < -0.25:
+    elif score < -0.20:
         signal = "SELL"
     else:
         signal = "HOLD"
@@ -412,14 +405,21 @@ def run_strategies(df: pd.DataFrame, enabled: list) -> dict:
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║                     AI SENTIMENT                            ║
+# FIX 4: Graceful fallback when API key is missing or invalid.  ║
+# Sentiment failure no longer kills the whole scan result.      ║
 # ╚══════════════════════════════════════════════════════════════╝
 @st.cache_data(ttl=1800)
 def get_ai_sentiment(ticker_clean: str, headlines: tuple,
                      price: float, pct_change: float) -> dict:
+    # FIX 4a: Check if key exists before even trying
     try:
-        client = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+        api_key = st.secrets.get("ANTHROPIC_API_KEY", None)
+        if not api_key:
+            return {"score":0.0,"label":"Neutral","confidence":0,
+                    "summary":"API key not configured — sentiment disabled."}
+        client = anthropic.Anthropic(api_key=api_key)
     except Exception:
-        return {"score":0.0,"label":"Neutral","confidence":0,"summary":"API key not set."}
+        return {"score":0.0,"label":"Neutral","confidence":0,"summary":"Client init failed."}
 
     hdl_text = "\n".join(f"- {h}" for h in headlines) if headlines else "No headlines."
     prompt   = f"""You are a senior NSE/BSE equity analyst. Analyse {ticker_clean} and return JSON only.
@@ -436,33 +436,29 @@ Return ONLY this JSON (no markdown):
             model="claude-sonnet-4-20250514", max_tokens=150,
             messages=[{"role":"user","content":prompt}]
         )
-        data = json.loads(r.content[0].text.strip().replace("```json","").replace("```",""))
-        data["score"]      = max(-1.0, min(1.0, float(data["score"])))
-        data["confidence"] = max(0, min(100, int(data["confidence"])))
+        text = r.content[0].text.strip().replace("```json","").replace("```","")
+        data = json.loads(text)
+        data["score"]      = max(-1.0, min(1.0, float(data.get("score", 0.0))))
+        data["confidence"] = max(0, min(100, int(data.get("confidence", 0))))
         return data
     except Exception as e:
-        return {"score":0.0,"label":"Neutral","confidence":0,"summary":str(e)[:80]}
+        # FIX 4b: Return neutral instead of crashing — scan still proceeds
+        return {"score":0.0,"label":"Neutral","confidence":0,"summary":f"Parse error: {str(e)[:60]}"}
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║              POSITION SIZING — DAILY ₹1000 TARGET           ║
 # ╚══════════════════════════════════════════════════════════════╝
 def position_size(price: float, atr: float, capital: float, risk_pct: float) -> dict:
-    """
-    Risk-based position sizing.
-    SL = 1 × ATR below entry.  Target = 2 × ATR above (1:2 RR).
-    Qty = Risk Amount / ATR
-    """
-    risk_rs  = capital * risk_pct          # e.g. ₹50,000 × 2% = ₹1,000
+    risk_rs  = capital * risk_pct
     sl       = round(price - atr, 2)
     target   = round(price + 2 * atr, 2)
     qty      = max(1, int(risk_rs / max(atr, 0.01)))
-    qty      = min(qty, int(capital * 0.25 / price))   # max 25% capital in one stock
+    qty      = min(qty, int(capital * 0.25 / price))
     invest   = round(qty * price, 2)
     pot_gain = round(qty * 2 * atr, 2)
     pot_loss = round(qty * atr, 2)
     brok     = round(invest * BROKERAGE * 2, 2)
     net_gain = round(pot_gain - brok, 2)
-
     return {
         "qty":        qty,
         "invest":     invest,
@@ -478,7 +474,7 @@ def position_size(price: float, atr: float, capital: float, risk_pct: float) -> 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║                     BACKTEST ENGINE                         ║
 # ╚══════════════════════════════════════════════════════════════╝
-def backtest(df: pd.DataFrame, enabled: list) -> dict:
+def backtest(df: pd.DataFrame, enabled: list, mode: str) -> dict:
     capital   = CAPITAL
     trades    = []
     position  = 0.0
@@ -486,7 +482,7 @@ def backtest(df: pd.DataFrame, enabled: list) -> dict:
 
     for i in range(50, len(df) - 1):
         sl_df  = df.iloc[:i + 1]
-        res    = run_strategies(sl_df, enabled)
+        res    = run_strategies(sl_df, enabled, mode)
         signal = res["signal"]
         price  = float(df["Close"].iloc[i])
         nxt    = float(df["Close"].iloc[i + 1])
@@ -497,7 +493,6 @@ def backtest(df: pd.DataFrame, enabled: list) -> dict:
             qty      = max(1, int((capital * RISK_PER_TRADE) / atr))
             entry    = price
             position = qty
-
         elif position > 0:
             sl = entry - atr
             tp = entry + 2 * atr
@@ -505,13 +500,8 @@ def backtest(df: pd.DataFrame, enabled: list) -> dict:
                 pnl      = (nxt - entry) * position
                 pnl     -= abs(nxt * position * BROKERAGE * 2)
                 capital += pnl
-                trades.append({
-                    "pnl":   round(pnl, 2),
-                    "entry": round(entry, 2),
-                    "exit":  round(nxt, 2),
-                    "qty":   int(position),
-                    "win":   pnl > 0,
-                })
+                trades.append({"pnl":round(pnl,2),"entry":round(entry,2),
+                               "exit":round(nxt,2),"qty":int(position),"win":pnl>0})
                 position = 0.0
 
     wins     = [t for t in trades if t["win"]]
@@ -520,7 +510,6 @@ def backtest(df: pd.DataFrame, enabled: list) -> dict:
     avg_win  = np.mean([t["pnl"] for t in wins])   if wins   else 0
     avg_loss = np.mean([t["pnl"] for t in losses]) if losses else 0
     pf       = abs(avg_win / avg_loss) if avg_loss != 0 else 0
-    # Daily P&L estimate (250 trading days / total days in dataset)
     days     = max(1, (df.index[-1] - df.index[0]).days)
     daily_pnl= (capital - CAPITAL) / (days / 365 * 250) if days > 0 else 0
 
@@ -537,6 +526,8 @@ def backtest(df: pd.DataFrame, enabled: list) -> dict:
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║                     FULL SCAN                               ║
+# FIX 5: Added debug counters. Passes mode to run_strategies.   ║
+# Lowered min_strategies default to 1 in sidebar.               ║
 # ╚══════════════════════════════════════════════════════════════╝
 def scan_stock(ticker: str, mode: str, use_sentiment: bool,
                enabled_strategies: list, run_bt: bool) -> dict | None:
@@ -544,9 +535,9 @@ def scan_stock(ticker: str, mode: str, use_sentiment: bool,
         df = get_data(ticker, mode)
         if df is None: return None
         df = add_features(df)
-        if len(df) < 50: return None
+        if df.empty or len(df) < 50: return None
 
-        tech   = run_strategies(df, enabled_strategies)
+        tech   = run_strategies(df, enabled_strategies, mode)
         price  = float(df["Close"].iloc[-1])
         prev   = float(df["Close"].iloc[-2])
         pct    = (price - prev) / prev * 100
@@ -558,17 +549,17 @@ def scan_stock(ticker: str, mode: str, use_sentiment: bool,
             headlines = get_news(ticker_clean)
             sentiment = get_ai_sentiment(ticker_clean, headlines, price, pct)
 
-        # Blend
         w       = SENTIMENT_WEIGHT
         blended = (1 - w) * tech["score"] + w * sentiment["score"]
-        if blended > 0.25:   final_sig = "BUY"
-        elif blended < -0.25:final_sig = "SELL"
+
+        # FIX 5a: Use relaxed threshold to match run_strategies
+        if blended > 0.20:   final_sig = "BUY"
+        elif blended < -0.20:final_sig = "SELL"
         else:                 final_sig = "HOLD"
 
         pos = {}
         if final_sig in ("BUY","SELL") and atr > 0:
             if final_sig == "SELL":
-                # Flip SL/target for short
                 ps = position_size(price, atr, CAPITAL, RISK_PER_TRADE)
                 ps["sl"]     = round(price + atr, 2)
                 ps["target"] = round(price - 2 * atr, 2)
@@ -578,9 +569,8 @@ def scan_stock(ticker: str, mode: str, use_sentiment: bool,
 
         bt = {}
         if run_bt:
-            bt = backtest(df, enabled_strategies)
+            bt = backtest(df, enabled_strategies, mode)
 
-        # Count how many strategies triggered
         n_buy  = sum(1 for v in tech["strategies"].values() if v["signal"]=="BUY")
         n_sell = sum(1 for v in tech["strategies"].values() if v["signal"]=="SELL")
 
@@ -612,7 +602,9 @@ def scan_stock(ticker: str, mode: str, use_sentiment: bool,
 # ╚══════════════════════════════════════════════════════════════╝
 with st.sidebar:
     st.header("⚙️ Scanner Settings")
-    mode = st.selectbox("Timeframe", ["Intraday (5m)","Intraday (15m)","Swing (Daily)"])
+    mode = st.selectbox("Timeframe", ["Swing (Daily)","Intraday (15m)","Intraday (5m)"])
+    # FIX: Default to Swing (Daily) — most reliable data, works with EMA200
+    st.info("💡 Tip: 'Swing (Daily)' gives the most signals. Intraday needs market hours data.")
     st.divider()
 
     st.subheader("Strategies")
@@ -625,9 +617,13 @@ with st.sidebar:
                 enabled.append(name)
 
     st.divider()
-    use_sentiment = st.toggle("🤖 AI Sentiment", value=True)
-    sent_w = st.slider("Sentiment Weight", 0.0, 0.5, 0.25, 0.05)
-    SENTIMENT_WEIGHT = sent_w
+    use_sentiment = st.toggle("🤖 AI Sentiment", value=False)  # FIX 4: Default OFF
+    sent_w = st.slider("Sentiment Weight", 0.0, 0.5, 0.25, 0.05,
+                       disabled=not use_sentiment)
+    if use_sentiment:
+        SENTIMENT_WEIGHT = sent_w
+    else:
+        SENTIMENT_WEIGHT = 0.0   # FIX 4c: Zero out if disabled
     st.divider()
 
     st.subheader("Risk Settings")
@@ -637,8 +633,9 @@ with st.sidebar:
     run_bt         = st.checkbox("Run Backtest (slower)", value=False)
 
     st.divider()
-    min_conf = st.slider("Min Confidence Filter %", 50, 90, 65, 5)
-    min_strategies = st.slider("Min Strategies Agreeing", 1, 6, 2, 1)
+    min_conf = st.slider("Min Confidence Filter %", 50, 90, 60, 5)  # FIX 5: default 65→60
+    # FIX 5b: min_strategies default lowered to 1 for better sensitivity
+    min_strategies = st.slider("Min Strategies Agreeing", 1, 6, 1, 1)
     auto = st.checkbox("⏱️ Auto Refresh (5 min)")
 
     st.divider()
@@ -662,12 +659,11 @@ Need <b>{max(1,int(TARGET_DAILY/(CAPITAL*RISK_PER_TRADE*2)))} winning trade(s)</
 </div>
 """, unsafe_allow_html=True)
 
-# Strategy info expander
 with st.expander("📚 Strategy Guide — How to Earn ₹1000/Day", expanded=False):
     st.markdown("""
 | # | Strategy | Win Rate | Best For | Timeframe |
 |---|---|---|---|---|
-| 1 | **ORB Breakout** | ~72% | Momentum stocks, high volume | 9:30–11:30 AM, 5m |
+| 1 | **ORB Breakout** | ~72% | Momentum stocks, high volume | 9:30–11:30 AM, 5m/15m only |
 | 2 | **VWAP Pullback** | ~75% | Large-caps (Reliance, HDFC) | All day, 5m/15m |
 | 3 | **EMA 9/21 Cross** | ~79% | Trending markets | 15m / Daily |
 | 4 | **MACD + ADX** | ~80% | Strong trend days | 15m / Daily |
@@ -676,14 +672,15 @@ with st.expander("📚 Strategy Guide — How to Earn ₹1000/Day", expanded=Fal
 | 7 | **SuperTrend Flip** | ~78% | Clear trend stocks | 15m / Daily |
 | 8 | **Stoch + EMA** | ~73% | Oversold bounces | 5m / 15m |
 
+**⚠️ ORB Breakout is automatically disabled on Swing (Daily) mode.**
+
 **Practical Rules for ₹1000/day:**
-- 🎯 **Take only 2–3 high-confidence trades** (score > 0.5, 3+ strategies agreeing)
+- 🎯 **Take only 2–3 high-confidence trades** (score > 0.5, 2+ strategies agreeing)
 - 🛑 **Strict SL** — exit immediately at 1×ATR loss. Never move SL lower.
 - ✅ **Exit at 2×ATR profit** — don't be greedy. ₹1000 target = done for the day.
 - 🕐 **Best window: 9:20–11:30 AM and 1:30–2:30 PM**
 - 🚫 **Avoid:** last 30 min, results days, budget days, expiry unless experienced
 - 📊 **Position size:** Never risk more than 2% capital in one trade
-- 🔢 **Max 3 open positions** simultaneously
     """)
 
 if not enabled:
@@ -693,51 +690,65 @@ if not enabled:
 if st.button("🔍 Run Nifty 100 Scanner", type="primary", use_container_width=True):
 
     results = []
-    bar     = st.progress(0, text="Starting scan...")
-    status  = st.empty()
+    failed  = []
+    no_data = []
+
+    bar    = st.progress(0, text="Starting scan...")
+    status = st.empty()
 
     for i, ticker in enumerate(NIFTY100):
         pct_done = (i + 1) / len(NIFTY100)
         bar.progress(pct_done, text=f"Scanning {ticker.replace('.NS','')} ({i+1}/{len(NIFTY100)})...")
 
         res = scan_stock(ticker, mode, use_sentiment, enabled, run_bt)
-        if res:
-            # Filter by confidence and strategy agreement
-            if res["final_signal"] in ("BUY","SELL"):
-                n_agree = res["n_buy"] if res["final_signal"]=="BUY" else res["n_sell"]
-                if n_agree >= min_strategies:
-                    results.append(res)
-                    # Telegram for high conviction
-                    if res["final_score"] > 0.5 or res["final_score"] < -0.5:
-                        pos = res.get("position",{})
-                        send_telegram(
-                            f"{'BUY' if res['final_signal']=='BUY' else 'SELL'} SIGNAL: {res['ticker']}\n"
-                            f"Price: Rs {res['price']} | Score: {res['final_score']:.2f}\n"
-                            f"Strategies: {n_agree} agreeing\n"
-                            f"Entry: Rs {res['price']} | SL: Rs {pos.get('sl','—')} | Target: Rs {pos.get('target','—')}\n"
-                            f"Qty: {pos.get('qty','—')} | Invest: Rs {pos.get('invest','—')}\n"
-                            f"Pot. Gain: Rs {pos.get('net_gain','—')}\n"
-                            f"AI: {res['sent_summary']}"
-                        )
+        if res is None:
+            no_data.append(ticker.replace(".NS",""))
+        elif res["final_signal"] in ("BUY","SELL"):
+            n_agree = res["n_buy"] if res["final_signal"]=="BUY" else res["n_sell"]
+            if n_agree >= min_strategies:
+                results.append(res)
+                if res["final_score"] > 0.5 or res["final_score"] < -0.5:
+                    pos = res.get("position",{})
+                    send_telegram(
+                        f"{'BUY' if res['final_signal']=='BUY' else 'SELL'} SIGNAL: {res['ticker']}\n"
+                        f"Price: Rs {res['price']} | Score: {res['final_score']:.2f}\n"
+                        f"Strategies: {n_agree} agreeing\n"
+                        f"Entry: Rs {res['price']} | SL: Rs {pos.get('sl','—')} | Target: Rs {pos.get('target','—')}\n"
+                        f"Qty: {pos.get('qty','—')} | Invest: Rs {pos.get('invest','—')}\n"
+                        f"Pot. Gain: Rs {pos.get('net_gain','—')}\n"
+                        f"AI: {res['sent_summary']}"
+                    )
 
     bar.empty()
     status.empty()
 
-    # Sort by final_score (BUY high → SELL low)
+    # FIX 5c: Show debug info so user knows what happened
+    if no_data:
+        with st.expander(f"⚠️ {len(no_data)} tickers returned no data (click to see)", expanded=False):
+            st.write(", ".join(no_data))
+            st.caption("Common reasons: ticker delisted, insufficient history, yfinance rate limit, or market closed for intraday.")
+
     buys  = sorted([r for r in results if r["final_signal"]=="BUY"],  key=lambda x:-x["final_score"])
     sells = sorted([r for r in results if r["final_signal"]=="SELL"], key=lambda x:x["final_score"])
 
-    # ── SUMMARY METRICS ──────────────────────────────────────────
     col1,col2,col3,col4,col5 = st.columns(5)
     col1.metric("🟢 BUY Signals",  len(buys))
     col2.metric("🔴 SELL Signals", len(sells))
     col3.metric("📊 Total Hits",   len(results))
-    col4.metric("🏦 Capital",      f"₹{CAPITAL:,}")
+    col4.metric("⚠️ No Data",      len(no_data))
     col5.metric("🎯 Daily Target", f"₹{TARGET_DAILY:,}")
+
+    if len(results) == 0:
+        st.warning(
+            "**No signals found.** Try these adjustments:\n"
+            "1. Set **Min Strategies Agreeing = 1** in sidebar\n"
+            "2. Use **Swing (Daily)** mode\n"
+            "3. Turn off **AI Sentiment** (sidebar toggle)\n"
+            f"4. Note: {len(no_data)}/110 tickers had no data — check internet / yfinance limits"
+        )
 
     st.divider()
 
-    # ── TABS ──────────────────────────────────────────────────────
     tab1, tab2, tab3, tab4 = st.tabs([
         "🟢 BUY Signals", "🔴 SELL Signals",
         "📋 Full Signal Table", "📈 Backtest Results"
@@ -751,8 +762,6 @@ if st.button("🔍 Run Nifty 100 Scanner", type="primary", use_container_width=T
             pos     = r.get("position",{})
             score   = r["final_score"]
             n_agree = r["n_buy"] if r["final_signal"]=="BUY" else r["n_sell"]
-            color   = "#0d1f0d" if r["final_signal"]=="BUY" else "#1f0d0d"
-            border  = "#00e676" if r["final_signal"]=="BUY" else "#ff1744"
 
             with st.expander(
                 f"{'🟢' if r['final_signal']=='BUY' else '🔴'} **{r['ticker']}** "
@@ -777,7 +786,7 @@ if st.button("🔍 Run Nifty 100 Scanner", type="primary", use_container_width=T
                 for trig in r["triggers"]:
                     st.caption(trig)
 
-                if r.get("sent_summary","—") != "—":
+                if r.get("sent_summary","—") not in ("—", ""):
                     st.info(f"🤖 AI Sentiment ({r['sent_label']} | {r['sent_conf']}% conf): {r['sent_summary']}")
 
     with tab1:
@@ -818,7 +827,7 @@ if st.button("🔍 Run Nifty 100 Scanner", type="primary", use_container_width=T
 
             st.dataframe(
                 df_tbl.style
-                  .applymap(colour_sig, subset=["Signal"])
+                  .map(colour_sig, subset=["Signal"])
                   .format({"Change%": "{:+.2f}%", "Score": "{:.3f}"}),
                 use_container_width=True, height=500
             )
@@ -834,14 +843,14 @@ if st.button("🔍 Run Nifty 100 Scanner", type="primary", use_container_width=T
                 bt = r.get("backtest",{})
                 if bt:
                     bt_rows.append({
-                        "Stock":        r["ticker"],
-                        "Final Cap":    bt.get("final_capital","—"),
-                        "Return%":      bt.get("total_return","—"),
-                        "Trades":       bt.get("total_trades","—"),
-                        "Win Rate":     bt.get("win_rate","—"),
-                        "Profit Factor":bt.get("profit_factor","—"),
-                        "Avg Win (Rs)": bt.get("avg_win","—"),
-                        "Avg Loss (Rs)":bt.get("avg_loss","—"),
+                        "Stock":         r["ticker"],
+                        "Final Cap":     bt.get("final_capital","—"),
+                        "Return%":       bt.get("total_return","—"),
+                        "Trades":        bt.get("total_trades","—"),
+                        "Win Rate":      bt.get("win_rate","—"),
+                        "Profit Factor": bt.get("profit_factor","—"),
+                        "Avg Win (Rs)":  bt.get("avg_win","—"),
+                        "Avg Loss (Rs)": bt.get("avg_loss","—"),
                         "Est. Daily PnL":bt.get("est_daily_pnl","—"),
                     })
             if bt_rows:

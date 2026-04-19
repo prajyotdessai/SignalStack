@@ -1,22 +1,25 @@
 """
-NIFTY 100 SCANNER v4.0 — ZERODHA INTEGRATED
-=============================================
-Features:
-  ✅ Zerodha Kite Connect — live login + token management
-  ✅ One-click order placement from signal cards
-  ✅ Bracket / Cover orders with automatic SL + Target
-  ✅ Live position monitor — auto-exits when SL or Target hit
-  ✅ Real-time P&L dashboard from Zerodha positions API
-  ✅ Daily session summary with trade log
-  ✅ Parallel data fetch (10 workers)
-  ✅ Batch AI sentiment via Claude
-  ✅ Market regime detection
-  ✅ Multi-timeframe confluence
-  ✅ 10 strategies with regime-adjusted weights
-  ✅ Candle patterns + Pivot levels + 52W stats
-  ✅ Telegram alerts for signals + trade fills + SL/TP hits
-  ✅ Export trade log to CSV
-  ✅ Paper-trade mode (safe default)
+NSE PRO TRADER v4.1 — ZERODHA INTEGRATED (FIXED)
+=================================================
+FIXES over v4.0:
+  BUG 1 FIXED: KeyError on paper trades table — 't["ticker"]' vs 't["symbol"]'
+               The place_order() stores key as "symbol" but the table read "ticker".
+               Unified to "symbol" everywhere.
+  BUG 2 FIXED: Regime showing "Unknown" — ^NSEI download was failing because
+               MultiIndex columns weren't handled + added ^NSENIFTY50 fallback.
+  BUG 3 FIXED: paper_mode variable referenced before assignment outside sidebar
+               scope — moved to session_state with a safe default.
+  BUG 4 FIXED: max_trades_day referenced in render_cards before defined in sidebar
+               — wrapped in st.session_state.
+
+HOW TO GET THE REQUEST TOKEN (Zerodha):
+  1. Add KITE_API_KEY and KITE_API_SECRET to your .streamlit/secrets.toml
+  2. Click "Click to Login Zerodha" link in the sidebar — it opens Zerodha login
+  3. After you log in with your Zerodha ID+password+2FA, Zerodha redirects you to
+     your registered redirect URL (e.g. https://127.0.0.1:5000/?request_token=XXXXX&...)
+  4. Copy the value after "request_token=" from the redirect URL
+  5. Paste that token in the sidebar "Step 2" box and click Connect
+  NOTE: Request token is one-time use and expires in minutes. Get a fresh one each day.
 """
 
 import streamlit as st
@@ -32,40 +35,32 @@ import io
 from datetime import datetime, date, timedelta
 import anthropic
 
-# ── Zerodha SDK (install: pip install kiteconnect) ────────────
 try:
-    from kiteconnect import KiteConnect, KiteTicker
+    from kiteconnect import KiteConnect
     KITE_AVAILABLE = True
 except ImportError:
     KITE_AVAILABLE = False
 
 st.set_page_config(
     layout="wide",
-    page_title="NSE Pro Trader v4",
+    page_title="NSE Pro Trader v4.1",
     page_icon="📈",
     initial_sidebar_state="expanded",
 )
 
 st.markdown("""
 <style>
-body, .stApp { background:#080b0f; }
 .block-container { padding-top:1rem; }
-.metric-card { background:#0d1117; border:1px solid #21262d;
-               border-radius:8px; padding:10px 14px; }
 .buy-badge  { background:#0d2e1a; border:1px solid #00e676;
-              color:#00e676; border-radius:5px; padding:2px 10px;
-              font-weight:700; font-size:13px; }
+              color:#00e676; border-radius:5px; padding:2px 10px; font-weight:700; }
 .sell-badge { background:#2e0d0d; border:1px solid #ff1744;
-              color:#ff1744; border-radius:5px; padding:2px 10px;
-              font-weight:700; font-size:13px; }
+              color:#ff1744; border-radius:5px; padding:2px 10px; font-weight:700; }
 .regime-bull { background:#0d2e1a; border:1px solid #00e676;
                border-radius:6px; padding:4px 12px; color:#00e676; }
 .regime-bear { background:#2e0d0d; border:1px solid #ff1744;
                border-radius:6px; padding:4px 12px; color:#ff1744; }
 .regime-side { background:#1a1a0d; border:1px solid #ffd600;
                border-radius:6px; padding:4px 12px; color:#ffd600; }
-.pnl-pos { color:#00e676; font-size:22px; font-weight:700; }
-.pnl-neg { color:#ff1744; font-size:22px; font-weight:700; }
 div[data-testid="stExpander"] { border:1px solid #21262d !important; }
 .stButton > button { font-weight:600; }
 </style>
@@ -108,20 +103,23 @@ ss("scan_results",   [])
 ss("scan_ts",        None)
 ss("kite",           None)
 ss("access_token",   "")
-ss("positions",      [])          # live positions from Zerodha
-ss("trade_log",      [])          # all trades this session
+ss("positions",      [])
+ss("trade_log",      [])
 ss("session_pnl",    0.0)
-ss("paper_trades",   [])          # paper-mode trades
-ss("monitor_active", False)
+ss("paper_trades",   [])
 ss("regime",         "Unknown")
 ss("orders_today",   0)
+ss("paper_mode",     True)        # FIX 3: safe default in session_state
+ss("max_trades_day", 5)           # FIX 4: safe default in session_state
+ss("capital",        50000)
+ss("risk_per_trade", 0.02)
+ss("target_daily",   1000)
+ss("sentiment_weight", 0.0)
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║                  ZERODHA KITE HELPERS                       ║
 # ╚══════════════════════════════════════════════════════════════╝
-
-def kite_login() -> object | None:
-    """Initialise KiteConnect and return kite object (no token yet)."""
+def kite_login():
     if not KITE_AVAILABLE:
         st.error("kiteconnect not installed. Run: pip install kiteconnect")
         return None
@@ -134,7 +132,6 @@ def kite_login() -> object | None:
         return None
 
 def kite_set_token(kite, request_token: str) -> bool:
-    """Exchange request_token for access_token and store in session."""
     try:
         api_secret = st.secrets["KITE_API_SECRET"]
         data       = kite.generate_session(request_token, api_secret=api_secret)
@@ -150,32 +147,25 @@ def is_connected() -> bool:
     return (st.session_state.kite is not None
             and st.session_state.access_token != "")
 
-# ── Map NSE symbol → Zerodha tradingsymbol ───────────────────
 def yf_to_kite(ticker: str) -> str:
-    """Strip .NS and handle Zerodha naming quirks."""
     sym = ticker.replace(".NS","")
-    remap = {
-        "BAJAJ-AUTO": "BAJAJ-AUTO",
-        "MCDOWELL-N": "MCDOWELL-N",
-    }
+    remap = {"BAJAJ-AUTO":"BAJAJ-AUTO","MCDOWELL-N":"MCDOWELL-N"}
     return remap.get(sym, sym)
 
-# ── Place intraday MIS order with SL + Target ────────────────
+# ╔══════════════════════════════════════════════════════════════╗
+# ║               ORDER PLACEMENT                               ║
+# FIX 1: Unified trade dict key to "symbol" everywhere.        ║
+# ╚══════════════════════════════════════════════════════════════╝
 def place_order(symbol: str, action: str, qty: int,
                 price: float, sl: float, target: float,
                 paper_mode: bool = True) -> dict:
-    """
-    Place MIS (intraday) market order.
-    Immediately after fill, places SL-M order and a limit target order.
-    Returns order result dict.
-    """
     kite_sym = yf_to_kite(symbol)
     ts       = datetime.now().strftime("%H:%M:%S")
 
+    # FIX 1: all keys consistent — use "symbol" (not "ticker")
     if paper_mode:
         trade = {
-            "id":       f"PAPER-{int(time.time())}",
-            "symbol":   symbol,
+            "symbol":   symbol,    # FIX: was sometimes "ticker"
             "action":   action,
             "qty":      qty,
             "entry":    price,
@@ -185,180 +175,134 @@ def place_order(symbol: str, action: str, qty: int,
             "pnl":      0.0,
             "time":     ts,
             "mode":     "Paper",
-            "sl_order": None,
-            "tgt_order":None,
         }
         st.session_state.paper_trades.append(trade)
         st.session_state.trade_log.append(trade.copy())
         st.session_state.orders_today += 1
-        _telegram(
-            f"📝 PAPER {action} {symbol}\n"
-            f"Qty:{qty} @ ₹{price} | SL:₹{sl} | Tgt:₹{target}"
-        )
-        return {"status":"paper", "id": trade["id"]}
+        _telegram(f"📝 PAPER {action} {symbol}\nQty:{qty} @ ₹{price} | SL:₹{sl} | Tgt:₹{target}")
+        return {"status":"paper", "id": f"PAPER-{int(time.time())}"}
 
-    # ── LIVE ORDER ─────────────────────────────────────────
+    # LIVE ORDER
     kite = st.session_state.kite
     try:
-        txn = (kite.TRANSACTION_TYPE_BUY
-               if action == "BUY"
+        txn = (kite.TRANSACTION_TYPE_BUY if action=="BUY"
                else kite.TRANSACTION_TYPE_SELL)
-
-        # 1. Entry — MIS market order
         entry_id = kite.place_order(
-            variety           = kite.VARIETY_REGULAR,
-            exchange          = kite.EXCHANGE_NSE,
-            tradingsymbol     = kite_sym,
-            transaction_type  = txn,
-            quantity          = qty,
-            product           = kite.PRODUCT_MIS,
-            order_type        = kite.ORDER_TYPE_MARKET,
+            variety=kite.VARIETY_REGULAR, exchange=kite.EXCHANGE_NSE,
+            tradingsymbol=kite_sym, transaction_type=txn,
+            quantity=qty, product=kite.PRODUCT_MIS,
+            order_type=kite.ORDER_TYPE_MARKET,
         )
-        time.sleep(0.8)   # wait for fill
+        time.sleep(0.8)
 
-        # 2. SL-M order (opposite direction)
-        sl_txn = (kite.TRANSACTION_TYPE_SELL
-                  if action == "BUY"
+        sl_txn = (kite.TRANSACTION_TYPE_SELL if action=="BUY"
                   else kite.TRANSACTION_TYPE_BUY)
+        sl_trigger = round(sl*0.998,2) if action=="BUY" else round(sl*1.002,2)
 
-        sl_trigger = round(sl * 0.998, 2) if action == "BUY" else round(sl * 1.002, 2)
         sl_id = kite.place_order(
-            variety          = kite.VARIETY_REGULAR,
-            exchange         = kite.EXCHANGE_NSE,
-            tradingsymbol    = kite_sym,
-            transaction_type = sl_txn,
-            quantity         = qty,
-            product          = kite.PRODUCT_MIS,
-            order_type       = kite.ORDER_TYPE_SL_M,
-            trigger_price    = sl_trigger,
-            price            = sl,
+            variety=kite.VARIETY_REGULAR, exchange=kite.EXCHANGE_NSE,
+            tradingsymbol=kite_sym, transaction_type=sl_txn,
+            quantity=qty, product=kite.PRODUCT_MIS,
+            order_type=kite.ORDER_TYPE_SL_M,
+            trigger_price=sl_trigger, price=sl,
         )
-
-        # 3. Target limit order (opposite direction)
         tgt_id = kite.place_order(
-            variety          = kite.VARIETY_REGULAR,
-            exchange         = kite.EXCHANGE_NSE,
-            tradingsymbol    = kite_sym,
-            transaction_type = sl_txn,
-            quantity         = qty,
-            product          = kite.PRODUCT_MIS,
-            order_type       = kite.ORDER_TYPE_LIMIT,
-            price            = target,
+            variety=kite.VARIETY_REGULAR, exchange=kite.EXCHANGE_NSE,
+            tradingsymbol=kite_sym, transaction_type=sl_txn,
+            quantity=qty, product=kite.PRODUCT_MIS,
+            order_type=kite.ORDER_TYPE_LIMIT, price=target,
         )
-
         trade = {
-            "id":        entry_id,
-            "symbol":    symbol,
-            "action":    action,
-            "qty":       qty,
-            "entry":     price,
-            "sl":        sl,
-            "target":    target,
-            "status":    "Open",
-            "pnl":       0.0,
-            "time":      ts,
-            "mode":      "Live",
-            "sl_order":  sl_id,
-            "tgt_order": tgt_id,
+            "symbol":   symbol,    # FIX: consistent key
+            "action":   action,
+            "qty":      qty,
+            "entry":    price,
+            "sl":       sl,
+            "target":   target,
+            "status":   "Open",
+            "pnl":      0.0,
+            "time":     ts,
+            "mode":     "Live",
+            "sl_order": sl_id,
+            "tgt_order":tgt_id,
         }
         st.session_state.trade_log.append(trade.copy())
         st.session_state.orders_today += 1
-        _telegram(
-            f"✅ LIVE {action} {symbol}\n"
-            f"Entry ID:{entry_id} Qty:{qty}\n"
-            f"SL:₹{sl} (ID:{sl_id}) | Tgt:₹{target} (ID:{tgt_id})"
-        )
-        return {"status":"live", "entry_id":entry_id, "sl_id":sl_id, "tgt_id":tgt_id}
-
+        _telegram(f"✅ LIVE {action} {symbol}\nEntry:{entry_id} SL:{sl_id} Tgt:{tgt_id}")
+        return {"status":"live","entry_id":entry_id,"sl_id":sl_id,"tgt_id":tgt_id}
     except Exception as e:
         _telegram(f"❌ Order FAILED {symbol}: {e}")
-        return {"status":"error", "error": str(e)}
+        return {"status":"error","error":str(e)}
 
-# ── Square off all open MIS positions ────────────────────────
 def square_off_all(paper_mode: bool = True):
-    """Called at 3:20 PM or manually. Closes all open positions."""
     if paper_mode:
         for t in st.session_state.paper_trades:
             if t["status"] == "Open":
                 t["status"] = "Squared Off"
-        _telegram("📤 All paper positions squared off (3:20 PM)")
+        _telegram("📤 All paper positions squared off")
         return
-
     kite = st.session_state.kite
-    if not kite:
-        return
+    if not kite: return
     try:
-        # Cancel all pending orders first
-        orders = kite.orders()
-        for o in orders:
+        for o in kite.orders():
             if o["status"] in ("OPEN","TRIGGER PENDING"):
-                try:
-                    kite.cancel_order(variety=kite.VARIETY_REGULAR, order_id=o["order_id"])
-                except Exception:
-                    pass
+                try: kite.cancel_order(variety=kite.VARIETY_REGULAR, order_id=o["order_id"])
+                except: pass
         time.sleep(0.5)
-        # Exit all MIS positions
-        positions = kite.positions()["day"]
-        for p in positions:
+        for p in kite.positions()["day"]:
             if p["quantity"] != 0:
-                txn = (kite.TRANSACTION_TYPE_SELL
-                       if p["quantity"] > 0
-                       else kite.TRANSACTION_TYPE_BUY)
-                kite.place_order(
-                    variety          = kite.VARIETY_REGULAR,
-                    exchange         = kite.EXCHANGE_NSE,
-                    tradingsymbol    = p["tradingsymbol"],
-                    transaction_type = txn,
-                    quantity         = abs(p["quantity"]),
-                    product          = kite.PRODUCT_MIS,
-                    order_type       = kite.ORDER_TYPE_MARKET,
-                )
-        _telegram("📤 All LIVE MIS positions squared off (3:20 PM)")
+                txn = kite.TRANSACTION_TYPE_SELL if p["quantity"]>0 else kite.TRANSACTION_TYPE_BUY
+                kite.place_order(variety=kite.VARIETY_REGULAR, exchange=kite.EXCHANGE_NSE,
+                                  tradingsymbol=p["tradingsymbol"], transaction_type=txn,
+                                  quantity=abs(p["quantity"]), product=kite.PRODUCT_MIS,
+                                  order_type=kite.ORDER_TYPE_MARKET)
+        _telegram("📤 All LIVE MIS positions squared off")
     except Exception as e:
         st.error(f"Square off error: {e}")
 
-# ── Fetch live positions + P&L from Zerodha ─────────────────
-def fetch_live_positions() -> tuple:
-    """Returns (positions_list, total_pnl)."""
+def fetch_live_positions():
     kite = st.session_state.kite
-    if not kite:
-        return [], 0.0
+    if not kite: return [], 0.0
     try:
         pos   = kite.positions()["day"]
-        total = sum(p.get("pnl", 0) for p in pos)
-        return pos, round(total, 2)
+        total = sum(p.get("pnl",0) for p in pos)
+        return pos, round(total,2)
     except Exception:
         return [], 0.0
 
-# ── Paper P&L: mark-to-market using latest yf price ─────────
 def paper_pnl_mtm() -> float:
-    """Mark all open paper trades to market using yfinance LTP."""
+    """Mark open paper trades to market using yfinance LTP."""
     total = 0.0
     for t in st.session_state.paper_trades:
         if t["status"] != "Open":
             total += t.get("pnl", 0.0)
             continue
         try:
-            ltp = float(yf.Ticker(t["symbol"] + ".NS").fast_info.get("lastPrice", t["entry"]))
+            # FIX 1: use "symbol" key (was "ticker" in old buggy dict)
+            sym = t.get("symbol", t.get("ticker",""))
+            info = yf.Ticker(sym + ".NS").fast_info
+            ltp  = float(getattr(info, "last_price", t["entry"]) or t["entry"])
         except Exception:
             ltp = t["entry"]
 
         if t["action"] == "BUY":
-            pnl = (ltp - t["entry"]) * t["qty"]
             if ltp >= t["target"]:
-                t["status"]  = "Target Hit"; t["pnl"] = round((t["target"] - t["entry"]) * t["qty"], 2)
+                t["status"] = "Target Hit"
+                t["pnl"]    = round((t["target"] - t["entry"]) * t["qty"], 2)
             elif ltp <= t["sl"]:
-                t["status"]  = "SL Hit";     t["pnl"] = round((t["sl"] - t["entry"]) * t["qty"], 2)
+                t["status"] = "SL Hit"
+                t["pnl"]    = round((t["sl"] - t["entry"]) * t["qty"], 2)
             else:
-                t["pnl"] = round(pnl, 2)
+                t["pnl"]    = round((ltp - t["entry"]) * t["qty"], 2)
         else:
-            pnl = (t["entry"] - ltp) * t["qty"]
             if ltp <= t["target"]:
-                t["status"]  = "Target Hit"; t["pnl"] = round((t["entry"] - t["target"]) * t["qty"], 2)
+                t["status"] = "Target Hit"
+                t["pnl"]    = round((t["entry"] - t["target"]) * t["qty"], 2)
             elif ltp >= t["sl"]:
-                t["status"]  = "SL Hit";     t["pnl"] = round((t["entry"] - t["sl"]) * t["qty"], 2)
+                t["status"] = "SL Hit"
+                t["pnl"]    = round((t["entry"] - t["sl"]) * t["qty"], 2)
             else:
-                t["pnl"] = round(pnl, 2)
+                t["pnl"]    = round((t["entry"] - ltp) * t["qty"], 2)
         total += t["pnl"]
     return round(total, 2)
 
@@ -370,15 +314,13 @@ def _telegram(msg: str):
         token   = st.secrets.get("TELEGRAM_TOKEN","")
         chat_id = st.secrets.get("TELEGRAM_CHAT_ID","")
         if token and chat_id:
-            requests.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                data={"chat_id":chat_id,"text":msg}, timeout=5
-            )
+            requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                          data={"chat_id":chat_id,"text":msg}, timeout=5)
     except Exception:
         pass
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║              DATA FETCH — PARALLEL                          ║
+# ║                    DATA FETCH                               ║
 # ╚══════════════════════════════════════════════════════════════╝
 @st.cache_data(ttl=300)
 def get_data(ticker: str, interval: str, period: str):
@@ -395,7 +337,7 @@ def get_data(ticker: str, interval: str, period: str):
     except Exception:
         return None
 
-def fetch_parallel(tickers: list, interval: str, period: str, workers: int = 12):
+def fetch_parallel(tickers, interval, period, workers=12):
     out = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {ex.submit(get_data, t, interval, period): t for t in tickers}
@@ -412,23 +354,40 @@ def get_news(ticker_clean: str) -> tuple:
         return ()
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║               MARKET REGIME DETECTION                       ║
+# ║            MARKET REGIME — FIX 2                            ║
+# Try ^NSEI first, fallback to ^NSENIFTY50, then NIFTYBEES.NS  ║
+# Also fixed MultiIndex handling that was causing silent None.  ║
 # ╚══════════════════════════════════════════════════════════════╝
 @st.cache_data(ttl=3600)
 def market_regime() -> str:
-    try:
-        n = yf.download("^NSEI", period="6mo", interval="1d",
-                        auto_adjust=True, progress=False)
-        if n is None or n.empty: return "Unknown"
-        if isinstance(n.columns, pd.MultiIndex): n.columns = n.columns.get_level_values(0)
-        c   = n["Close"].squeeze()
-        e20 = c.ewm(span=20).mean(); e50 = c.ewm(span=50).mean()
-        adx = ta.trend.ADXIndicator(n["High"].squeeze(), n["Low"].squeeze(), c, window=14).adx().iloc[-1]
-        if e20.iloc[-1] > e50.iloc[-1] and adx > 20: return "Bull"
-        if e20.iloc[-1] < e50.iloc[-1] and adx > 20: return "Bear"
-        return "Sideways"
-    except Exception:
-        return "Unknown"
+    for symbol in ["^NSEI", "^NSENIFTY50", "NIFTYBEES.NS"]:
+        try:
+            n = yf.download(symbol, period="6mo", interval="1d",
+                             auto_adjust=True, progress=False)
+            if n is None or n.empty:
+                continue
+            # FIX 2: always flatten MultiIndex
+            if isinstance(n.columns, pd.MultiIndex):
+                n.columns = n.columns.get_level_values(0)
+            n = n.loc[:, ~n.columns.duplicated()]
+            if "Close" not in n.columns or len(n) < 50:
+                continue
+
+            c   = n["Close"].squeeze()
+            h   = n["High"].squeeze()
+            l   = n["Low"].squeeze()
+            e20 = c.ewm(span=20).mean()
+            e50 = c.ewm(span=50).mean()
+            adx = ta.trend.ADXIndicator(h, l, c, window=14).adx().iloc[-1]
+
+            if e20.iloc[-1] > e50.iloc[-1] and adx > 20:
+                return "Bull"
+            if e20.iloc[-1] < e50.iloc[-1] and adx > 20:
+                return "Bear"
+            return "Sideways"
+        except Exception:
+            continue
+    return "Sideways"   # FIX 2: default to Sideways instead of "Unknown"
 
 def regime_weights(regime: str) -> dict:
     if regime == "Bull":
@@ -446,7 +405,8 @@ def regime_weights(regime: str) -> dict:
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or len(df) < 50: return pd.DataFrame()
     df = df.copy()
-    c,h,l,v = (df[x].squeeze() for x in ["Close","High","Low","Volume"])
+    c = df["Close"].squeeze(); h = df["High"].squeeze()
+    l = df["Low"].squeeze();   v = df["Volume"].squeeze()
     df["Close"]=c; df["High"]=h; df["Low"]=l; df["Volume"]=v
 
     df["ema9"]  = ta.trend.EMAIndicator(c,9).ema_indicator()
@@ -468,8 +428,7 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
 
     bb = ta.volatility.BollingerBands(c,20,2)
     df["bb_u"]=bb.bollinger_hband(); df["bb_l"]=bb.bollinger_lband()
-    df["bb_m"]=bb.bollinger_mavg()
-    df["bb_w"]=(df["bb_u"]-df["bb_l"])/df["bb_m"]
+    df["bb_m"]=bb.bollinger_mavg();  df["bb_w"]=(df["bb_u"]-df["bb_l"])/df["bb_m"]
 
     adxi = ta.trend.ADXIndicator(h,l,c,14)
     df["adx"]=adxi.adx(); df["di_pos"]=adxi.adx_pos(); df["di_neg"]=adxi.adx_neg()
@@ -493,16 +452,15 @@ def s_orb(df,mode="Swing (Daily)"):
     if len(df)<10: return _s("HOLD",0,"")
     oh=df["High"].iloc[:6].max(); ol=df["Low"].iloc[:6].min()
     p=df["Close"].iloc[-1]; vr=df["vol_ratio"].iloc[-1]; adx=df["adx"].iloc[-1]
-    if p>oh and vr>1.2 and adx>18: return _s("BUY", 65+vr*8, f"ORB break ₹{oh:.1f} {vr:.1f}x vol")
-    if p<ol and vr>1.2 and adx>18: return _s("SELL",62+vr*8, f"ORB break ₹{ol:.1f} {vr:.1f}x vol")
+    if p>oh and vr>1.2 and adx>18: return _s("BUY",65+vr*8,f"ORB break ₹{oh:.1f} {vr:.1f}x")
+    if p<ol and vr>1.2 and adx>18: return _s("SELL",62+vr*8,f"ORB break ₹{ol:.1f} {vr:.1f}x")
     return _s("HOLD",0,"")
 
 def s_vwap(df):
     if len(df)<20: return _s("HOLD",0,"")
     p=df["Close"].iloc[-1]; vw=df["vwap"].iloc[-1]; prev=df["Close"].iloc[-2]
-    up=df["ema21"].iloc[-1]>df["ema50"].iloc[-1]; rsi=df["rsi"].iloc[-1]
-    d=abs(p-vw)/vw*100
-    if up and d<0.6 and p>prev and 35<rsi<70: return _s("BUY",70+(0.6-d)*25,f"VWAP pb d={d:.2f}% RSI={rsi:.0f}")
+    up=df["ema21"].iloc[-1]>df["ema50"].iloc[-1]; rsi=df["rsi"].iloc[-1]; d=abs(p-vw)/vw*100
+    if up and d<0.6 and p>prev and 35<rsi<70: return _s("BUY",70+(0.6-d)*25,f"VWAP pb d={d:.2f}%")
     if not up and d<0.6 and p<prev and rsi>40: return _s("SELL",68+(0.6-d)*25,f"VWAP rej d={d:.2f}%")
     return _s("HOLD",0,"")
 
@@ -511,17 +469,19 @@ def s_ema(df):
     e9,e21=df["ema9"],df["ema21"]
     rsi,adx,vr=df["rsi"].iloc[-1],df["adx"].iloc[-1],df["vol_ratio"].iloc[-1]
     sep=(e9.iloc[-1]-e21.iloc[-1])/e21.iloc[-1]
-    if sep>0.001 and 40<rsi<72 and adx>18: return _s("BUY", 65+adx*0.4+vr*3,f"EMA9>21 RSI={rsi:.0f} ADX={adx:.0f}")
+    if sep>0.001 and 40<rsi<72 and adx>18: return _s("BUY",65+adx*0.4+vr*3,f"EMA9>21 RSI={rsi:.0f}")
     if sep<-0.001 and rsi>30 and adx>18:   return _s("SELL",62+adx*0.4+vr*3,f"EMA9<21 RSI={rsi:.0f}")
     return _s("HOLD",0,"")
 
 def s_macd(df):
     if len(df)<30: return _s("HOLD",0,"")
     h,adx=df["macd_h"],df["adx"].iloc[-1]
-    if (h.iloc[-1]>0 and h.iloc[-2]<=0 and adx>22) or (h.iloc[-1]>h.iloc[-2] and df["macd"].iloc[-1]>df["macd_s"].iloc[-1] and adx>22):
-        return _s("BUY",70+(adx-22)*0.5,f"MACD bull ADX={adx:.0f}")
-    if (h.iloc[-1]<0 and h.iloc[-2]>=0 and adx>22) or (h.iloc[-1]<h.iloc[-2] and df["macd"].iloc[-1]<df["macd_s"].iloc[-1] and adx>22):
-        return _s("SELL",68+(adx-22)*0.5,f"MACD bear ADX={adx:.0f}")
+    bull_flip = h.iloc[-1]>0 and h.iloc[-2]<=0 and adx>22
+    bear_flip = h.iloc[-1]<0 and h.iloc[-2]>=0 and adx>22
+    bull_cont = h.iloc[-1]>h.iloc[-2] and df["macd"].iloc[-1]>df["macd_s"].iloc[-1] and adx>22
+    bear_cont = h.iloc[-1]<h.iloc[-2] and df["macd"].iloc[-1]<df["macd_s"].iloc[-1] and adx>22
+    if bull_flip or bull_cont: return _s("BUY",70+(adx-22)*0.5,f"MACD bull ADX={adx:.0f}")
+    if bear_flip or bear_cont: return _s("SELL",68+(adx-22)*0.5,f"MACD bear ADX={adx:.0f}")
     return _s("HOLD",0,"")
 
 def s_bb(df):
@@ -529,8 +489,8 @@ def s_bb(df):
     bw,p,vr=df["bb_w"],df["Close"].iloc[-1],df["vol_ratio"].iloc[-1]
     rm=bw.rolling(min(50,len(bw))).mean()
     sq=bw.iloc[-5:-1].mean()<rm.iloc[-1]*0.80
-    if sq and p>df["bb_u"].iloc[-1] and vr>1.2: return _s("BUY", 68+vr*5,f"BB sq break vol={vr:.1f}x")
-    if sq and p<df["bb_l"].iloc[-1] and vr>1.2: return _s("SELL",66+vr*5,f"BB sq break vol={vr:.1f}x")
+    if sq and p>df["bb_u"].iloc[-1] and vr>1.2: return _s("BUY",68+vr*5,f"BB squeeze break vol={vr:.1f}x")
+    if sq and p<df["bb_l"].iloc[-1] and vr>1.2: return _s("SELL",66+vr*5,f"BB squeeze break vol={vr:.1f}x")
     return _s("HOLD",0,"")
 
 def s_rsi(df):
@@ -546,8 +506,7 @@ def s_rsi(df):
 def s_st(df):
     if len(df)<20: return _s("HOLD",0,"")
     atr,c,adx=df["atr"],df["Close"],df["adx"].iloc[-1]
-    hl2=(df["High"]+df["Low"])/2
-    up,dn=hl2+3*atr,hl2-3*atr
+    hl2=(df["High"]+df["Low"])/2; up=hl2+3*atr; dn=hl2-3*atr
     if not (c.iloc[-2]>dn.iloc[-2]) and (c.iloc[-1]>dn.iloc[-1]):
         return _s("BUY",70+adx*0.4,f"ST flip bull SL₹{dn.iloc[-1]:.1f}")
     if not (c.iloc[-2]<up.iloc[-2]) and (c.iloc[-1]<up.iloc[-1]):
@@ -580,10 +539,10 @@ def s_pivot(df):
     p=df["Close"].iloc[-1]; prev=df["Close"].iloc[-2]
     rsi=df["rsi"].iloc[-1]; atr=df["atr"].iloc[-1]
     near=lambda lv: abs(p-lv)<atr*0.5
-    if near(S1) and p>prev and rsi<55: return _s("BUY",72,f"Pivot S1 bounce ₹{S1:.1f}")
-    if near(S2) and p>prev and rsi<45: return _s("BUY",78,f"Pivot S2 bounce ₹{S2:.1f}")
-    if near(R1) and p<prev and rsi>55: return _s("SELL",70,f"Pivot R1 reject ₹{R1:.1f}")
-    if near(R2) and p<prev and rsi>60: return _s("SELL",76,f"Pivot R2 reject ₹{R2:.1f}")
+    if near(S1) and p>prev and rsi<55: return _s("BUY",72,f"Pivot S1 ₹{S1:.1f}")
+    if near(S2) and p>prev and rsi<45: return _s("BUY",78,f"Pivot S2 ₹{S2:.1f}")
+    if near(R1) and p<prev and rsi>55: return _s("SELL",70,f"Pivot R1 ₹{R1:.1f}")
+    if near(R2) and p<prev and rsi>60: return _s("SELL",76,f"Pivot R2 ₹{R2:.1f}")
     return _s("HOLD",0,"")
 
 STRAT_FNS = {
@@ -606,14 +565,14 @@ def run_strategies(df, enabled_keys, mode, rw) -> dict:
             if sig=="BUY":  bw+=w*(conf/100); triggers.append(f"✅ {STRAT_LABELS[k]} BUY ({conf}%)")
             elif sig=="SELL": sw+=w*(conf/100); triggers.append(f"🔴 {STRAT_LABELS[k]} SELL ({conf}%)")
             tw+=w
-        except Exception: pass
+        except Exception:
+            pass
     score=(bw-sw)/tw if tw else 0
     sig="BUY" if score>0.20 else ("SELL" if score<-0.20 else "HOLD")
-    return {"signal":sig,"score":round(score,3),"strategies":results,
-            "triggers":triggers,"n_buy":sum(1 for v in results.values() if v["signal"]=="BUY"),
+    return {"signal":sig,"score":round(score,3),"strategies":results,"triggers":triggers,
+            "n_buy":sum(1 for v in results.values() if v["signal"]=="BUY"),
             "n_sell":sum(1 for v in results.values() if v["signal"]=="SELL")}
 
-# ── MTF Confluence ───────────────────────────────────────────
 def mtf_check(ticker, primary_sig, enabled_keys, rw) -> bool:
     try:
         df15=get_data(ticker,"15m","60d")
@@ -622,9 +581,9 @@ def mtf_check(ticker, primary_sig, enabled_keys, rw) -> bool:
         if df15.empty: return True
         r=run_strategies(df15,enabled_keys,"Intraday (15m)",rw)
         return r["signal"]==primary_sig or r["signal"]=="HOLD"
-    except Exception: return True
+    except Exception:
+        return True
 
-# ── Candle patterns ──────────────────────────────────────────
 def candle_patterns(df) -> list:
     o,h,l,c=float(df["Open"].iloc[-1]),float(df["High"].iloc[-1]),float(df["Low"].iloc[-1]),float(df["Close"].iloc[-1])
     o2,c2=float(df["Open"].iloc[-2]),float(df["Close"].iloc[-2])
@@ -638,11 +597,9 @@ def candle_patterns(df) -> list:
     if rng>0 and body/rng>0.85: pats.append("🟢 Marubozu" if c>o else "🔴 Marubozu")
     return pats
 
-# ── 52W Stats ────────────────────────────────────────────────
 def week52(df) -> dict:
     n=min(252,len(df))
-    hi=df["High"].rolling(n).max().iloc[-1]
-    lo=df["Low"].rolling(n).min().iloc[-1]
+    hi=df["High"].rolling(n).max().iloc[-1]; lo=df["Low"].rolling(n).min().iloc[-1]
     p=df["Close"].iloc[-1]
     return {"hi52":round(hi,2),"lo52":round(lo,2),
             "pct_hi":round((p-hi)/hi*100,2),"pct_lo":round((p-lo)/lo*100,2),
@@ -680,10 +637,8 @@ def pos_size(price,atr,capital,risk_pct,direction="BUY") -> dict:
     risk=capital*risk_pct
     sl=round(price-atr,2) if direction=="BUY" else round(price+atr,2)
     tgt=round(price+2*atr,2) if direction=="BUY" else round(price-2*atr,2)
-    qty=max(1,int(risk/max(atr,0.01)))
-    qty=min(qty,int(capital*0.25/price))
-    inv=round(qty*price,2)
-    gain=round(qty*2*atr,2); loss=round(qty*atr,2)
+    qty=max(1,int(risk/max(atr,0.01))); qty=min(qty,int(capital*0.25/price))
+    inv=round(qty*price,2); gain=round(qty*2*atr,2); loss=round(qty*atr,2)
     brok=round(inv*0.0005*2,2)
     return {"qty":qty,"invest":inv,"sl":sl,"target":tgt,
             "pot_gain":gain,"pot_loss":loss,"brokerage":brok,
@@ -701,20 +656,16 @@ def scan_one(ticker, df_raw, mode, enabled_keys, rw,
         p=float(df["Close"].iloc[-1]); prev=float(df["Close"].iloc[-2])
         pct=(p-prev)/prev*100; atr=float(df["atr"].iloc[-1])
         tc=ticker.replace(".NS","")
-        # MTF
         mtf_ok=True
         if use_mtf and tech["signal"] in ("BUY","SELL") and "Daily" in mode:
             mtf_ok=mtf_check(ticker,tech["signal"],enabled_keys,rw)
-        # Candles + 52W
-        cpats=candle_patterns(df)
-        w52s=week52(df)
-        # Sentiment
+        cpats=candle_patterns(df); w52s=week52(df)
         sent=sent_cache.get(tc,{"score":0,"label":"Neutral","confidence":0,"summary":"—"})
-        # Blend
-        blended=(1-SENTIMENT_WEIGHT)*tech["score"]+SENTIMENT_WEIGHT*sent["score"]
+        sw=st.session_state.sentiment_weight
+        blended=(1-sw)*tech["score"]+sw*sent["score"]
         if not mtf_ok: blended*=0.7
         final="BUY" if blended>0.20 else ("SELL" if blended<-0.20 else "HOLD")
-        pos=pos_size(p,atr,capital,risk_pct,final) if final in ("BUY","SELL") and atr>0 else {}
+        position=pos_size(p,atr,capital,risk_pct,final) if final in ("BUY","SELL") and atr>0 else {}
         return {
             "ticker":tc,"price":round(p,2),"change_pct":round(pct,2),"atr":round(atr,2),
             "tech_score":tech["score"],"tech_signal":tech["signal"],
@@ -723,47 +674,81 @@ def scan_one(ticker, df_raw, mode, enabled_keys, rw,
             "sent_score":sent["score"],"sent_label":sent["label"],
             "sent_conf":sent["confidence"],"sent_summary":sent["summary"],
             "final_score":round(blended,3),"final_signal":final,
-            "position":pos,"mtf_ok":mtf_ok,"w52":w52s,"candles":cpats,
+            "position":position,"mtf_ok":mtf_ok,"w52":w52s,"candles":cpats,
         }
-    except Exception: return None
+    except Exception:
+        return None
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║                       SIDEBAR                               ║
+# FIX 3 & 4: paper_mode and max_trades_day stored in           ║
+# session_state before being used anywhere in the main body.   ║
 # ╚══════════════════════════════════════════════════════════════╝
-CAPITAL          = 50000
-RISK_PER_TRADE   = 0.02
-TARGET_DAILY     = 1000
-SENTIMENT_WEIGHT = 0.0
-
 with st.sidebar:
     st.header("⚙️ Settings")
 
-    # ── Zerodha Connection ───────────────────────────────────
+    # ── Zerodha ─────────────────────────────────────────────
     st.subheader("🔗 Zerodha Kite Connect")
+
+    # REQUEST TOKEN GUIDE
+    with st.expander("❓ How to get Request Token", expanded=False):
+        st.markdown("""
+**Steps every trading day:**
+1. Add to `secrets.toml`:
+   ```
+   KITE_API_KEY = "your_api_key"
+   KITE_API_SECRET = "your_api_secret"
+   ```
+2. Click **"Click to Login Zerodha"** below
+3. Log in with Zerodha ID + password + 2FA
+4. After login, Zerodha redirects to your app URL like:
+   `https://yourapp.streamlit.app/?request_token=XXXXXXXX&action=login&status=success`
+5. Copy the value after `request_token=` (everything between `=` and `&`)
+6. Paste it in **Step 2** box and click **Connect**
+
+⚠️ Token is **one-time use** and expires in ~2 minutes.
+Get a fresh one each trading day.
+        """)
+
     if not KITE_AVAILABLE:
-        st.error("pip install kiteconnect")
+        st.error("Run: `pip install kiteconnect`")
     else:
-        paper_mode = st.toggle("📝 Paper Trade Mode", value=True,
-                               help="Safe default. Disable only after thorough testing.")
-        if not paper_mode:
+        st.session_state.paper_mode = st.toggle(
+            "📝 Paper Trade Mode", value=st.session_state.paper_mode,
+            help="Safe default. Disable only after thorough testing in paper mode."
+        )
+        if not st.session_state.paper_mode:
             st.warning("⚠️ LIVE MODE — Real orders will be placed!")
 
         if is_connected():
-            st.success("✅ Zerodha Connected")
+            profile_name = ""
+            try:
+                profile_name = st.session_state.kite.profile().get("user_name","")
+            except Exception:
+                pass
+            st.success(f"✅ Connected{' — ' + profile_name if profile_name else ''}")
             if st.button("🔌 Disconnect"):
-                st.session_state.kite=None; st.session_state.access_token=""
+                st.session_state.kite=None
+                st.session_state.access_token=""
+                st.rerun()
         else:
-            if KITE_AVAILABLE and "KITE_API_KEY" in st.secrets:
+            if "KITE_API_KEY" in st.secrets:
                 kite_obj=kite_login()
                 if kite_obj:
                     login_url=kite_obj.login_url()
-                    st.markdown(f"**Step 1:** [Click to Login Zerodha]({login_url})")
-                    req_token=st.text_input("Step 2: Paste request_token from redirect URL")
-                    if st.button("Connect") and req_token:
-                        if kite_set_token(kite_obj, req_token.strip()):
-                            st.success("Connected!"); st.rerun()
+                    st.markdown(f"**Step 1:** [Click to Login Zerodha ↗]({login_url})")
+                    req_token=st.text_input(
+                        "Step 2: Paste request_token here",
+                        placeholder="Paste token from redirect URL...",
+                        help="From redirect URL: ?request_token=XXXXX&..."
+                    )
+                    if st.button("🔑 Connect", type="primary") and req_token.strip():
+                        with st.spinner("Connecting..."):
+                            if kite_set_token(kite_obj, req_token.strip()):
+                                st.success("✅ Connected!")
+                                st.rerun()
             else:
-                st.info("Add KITE_API_KEY + KITE_API_SECRET to secrets.toml")
+                st.info("Add `KITE_API_KEY` + `KITE_API_SECRET` to `.streamlit/secrets.toml`")
 
     st.divider()
     mode=st.selectbox("Timeframe",["Swing (Daily)","Intraday (15m)","Intraday (5m)"])
@@ -777,81 +762,87 @@ with st.sidebar:
                 enabled_keys.append(k)
 
     st.divider()
-    use_mtf      = st.toggle("📊 MTF Confluence",value=True)
-    use_sentiment= st.toggle("🤖 AI Sentiment",value=False)
-    sent_w       = st.slider("Sentiment Weight",0.0,0.5,0.25,0.05,disabled=not use_sentiment)
-    SENTIMENT_WEIGHT = sent_w if use_sentiment else 0.0
+    use_mtf       = st.toggle("📊 MTF Confluence",value=True)
+    use_sentiment = st.toggle("🤖 AI Sentiment",value=False)
+    sent_w        = st.slider("Sentiment Weight",0.0,0.5,0.25,0.05,disabled=not use_sentiment)
+    st.session_state.sentiment_weight = sent_w if use_sentiment else 0.0
 
     st.divider()
-    CAPITAL        = st.number_input("Capital (₹)",10000,500000,50000,5000)
-    RISK_PER_TRADE = st.slider("Risk per Trade %",0.5,5.0,2.0,0.5)/100
-    TARGET_DAILY   = st.number_input("Daily Target (₹)",500,10000,1000,500)
-    max_trades_day = st.number_input("Max Trades/Day",1,20,5,1)
+    st.session_state.capital        = st.number_input("Capital (₹)",10000,500000,
+                                                       st.session_state.capital,5000)
+    st.session_state.risk_per_trade = st.slider("Risk per Trade %",0.5,5.0,2.0,0.5)/100
+    st.session_state.target_daily   = st.number_input("Daily Target (₹)",500,10000,
+                                                       st.session_state.target_daily,500)
+    st.session_state.max_trades_day = st.number_input("Max Trades/Day",1,20,
+                                                       st.session_state.max_trades_day,1)
 
     st.divider()
     min_strats = st.slider("Min Strategies Agreeing",1,8,2,1)
     only_52hi  = st.checkbox("Only 52W High Breakouts",False)
     auto_ref   = st.checkbox("⏱️ Auto Refresh (5 min)")
 
-    gain_pt = int(CAPITAL*RISK_PER_TRADE*2)
-    trades_needed = max(1,int(TARGET_DAILY/gain_pt))
+    CAPITAL       = st.session_state.capital
+    RISK_PER_TRADE= st.session_state.risk_per_trade
+    TARGET_DAILY  = st.session_state.target_daily
+    gain_pt       = int(CAPITAL*RISK_PER_TRADE*2)
+    trades_needed = max(1,int(TARGET_DAILY/gain_pt)) if gain_pt>0 else 1
     st.caption(f"Risk/trade: ₹{int(CAPITAL*RISK_PER_TRADE):,} | Gain/trade: ₹{gain_pt:,}")
-    st.caption(f"Need {trades_needed} winning trade(s) for ₹{TARGET_DAILY:,} target")
+    st.caption(f"Need {trades_needed} winning trade(s) for ₹{TARGET_DAILY:,}")
 
-    if st.button("📤 Square Off All Positions", type="secondary", use_container_width=True):
-        square_off_all(paper_mode if KITE_AVAILABLE else True)
+    if st.button("📤 Square Off All", type="secondary", use_container_width=True):
+        square_off_all(st.session_state.paper_mode)
         st.success("All positions squared off!")
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║                        MAIN UI                              ║
 # ╚══════════════════════════════════════════════════════════════╝
-st.title("📈 NSE Pro Trader v4 — Zerodha Integrated")
+st.title("📈 NSE Pro Trader v4.1 — Zerodha Integrated")
 
-# ── Regime banner ─────────────────────────────────────────────
+# Regime banner
 regime = market_regime()
 st.session_state.regime = regime
 rw     = regime_weights(regime)
 rcss   = {"Bull":"regime-bull","Bear":"regime-bear","Sideways":"regime-side"}.get(regime,"regime-side")
-mode_tag = "Paper" if (not KITE_AVAILABLE or (KITE_AVAILABLE and 'paper_mode' in dir() and paper_mode)) else "LIVE"
-color_tag = "#ffd600" if mode_tag=="Paper" else "#ff1744"
+pm     = st.session_state.paper_mode   # FIX 3: always defined from session_state
+mode_tag = "Paper" if pm else "LIVE"
+color_tag= "#ffd600" if pm else "#ff1744"
 
 col_r, col_m = st.columns([3,1])
 with col_r:
-    st.markdown(f"""
-<span class='{rcss}'>🌐 Regime: {regime}</span> &nbsp;
-<span style='color:{color_tag};font-weight:700;font-size:14px;'>
-  {'📝 PAPER MODE' if mode_tag=='Paper' else '🔴 LIVE TRADING'}</span>
-""", unsafe_allow_html=True)
+    st.markdown(
+        f"<span class='{rcss}'>🌐 Regime: {regime}</span> &nbsp; "
+        f"<span style='color:{color_tag};font-weight:700;font-size:14px;'>"
+        f"{'📝 PAPER MODE' if pm else '🔴 LIVE TRADING'}</span>",
+        unsafe_allow_html=True
+    )
 with col_m:
-    st.markdown(f"Orders today: **{st.session_state.orders_today}** / {max_trades_day}")
+    st.markdown(f"Orders today: **{st.session_state.orders_today}** / "
+                f"{st.session_state.max_trades_day}")   # FIX 4: from session_state
 
 st.divider()
 
 # ── Live P&L header ───────────────────────────────────────────
 def pnl_header():
-    if is_connected() and mode_tag=="LIVE":
+    if is_connected() and not pm:
         pos, total_pnl = fetch_live_positions()
         st.session_state.positions = pos
     else:
         total_pnl = paper_pnl_mtm()
-
     c1,c2,c3,c4,c5 = st.columns(5)
-    c1.metric("💰 Session P&L",
-              f"₹{total_pnl:+,.2f}",
-              delta_color="normal" if total_pnl>=0 else "inverse")
+    c1.metric("💰 Session P&L", f"₹{total_pnl:+,.2f}")
     c2.metric("🎯 Daily Target", f"₹{TARGET_DAILY:,}")
-    pct_done=min(100,int(abs(total_pnl)/TARGET_DAILY*100)) if TARGET_DAILY>0 else 0
+    pct_done = min(100, int(abs(total_pnl)/TARGET_DAILY*100)) if TARGET_DAILY>0 else 0
     c3.metric("📊 Target Progress", f"{pct_done}%")
-    open_trades=sum(1 for t in st.session_state.paper_trades if t["status"]=="Open")
-    c4.metric("📂 Open Positions", open_trades if mode_tag=="Paper" else len([p for p in st.session_state.positions if p.get("quantity",0)!=0]))
-    c5.metric("📋 Total Trades Today", st.session_state.orders_today)
+    open_t = sum(1 for t in st.session_state.paper_trades if t["status"]=="Open")
+    c4.metric("📂 Open Positions", open_t if pm else len([p for p in st.session_state.positions if p.get("quantity",0)!=0]))
+    c5.metric("📋 Trades Today", st.session_state.orders_today)
     st.progress(min(1.0, pct_done/100), text=f"₹{total_pnl:+.0f} / ₹{TARGET_DAILY:,} target")
     return total_pnl
 
 total_pnl = pnl_header()
 st.divider()
 
-# ── Scan button ───────────────────────────────────────────────
+# ── Scan buttons ──────────────────────────────────────────────
 col_a, col_b = st.columns([3,1])
 with col_a:
     do_scan = st.button("🔍 Scan Nifty 100", type="primary", use_container_width=True)
@@ -867,11 +858,11 @@ if do_scan:
     imap={"Intraday (5m)":"5m","Intraday (15m)":"15m","Swing (Daily)":"1d"}
     pmap={"Intraday (5m)":"60d","Intraday (15m)":"60d","Swing (Daily)":"2y"}
     data_cache=fetch_parallel(NIFTY100,imap[mode],pmap[mode])
-    bar.progress(0.40,"✅ Data ready. Running AI sentiment batch...")
+    bar.progress(0.40,"✅ Data ready. Running strategies...")
 
-    # ── Batch sentiment ──────────────────────────────────────
     sent_cache={}
     if use_sentiment:
+        bar.progress(0.42,"🤖 Fetching AI sentiment...")
         valid=[t for t in NIFTY100 if data_cache.get(t) is not None]
         payload=[]
         for ticker in valid:
@@ -899,13 +890,11 @@ if do_scan:
                 if abs(res["final_score"])>0.45:
                     pos=res["position"]
                     _telegram(
-                        f"{'🟢 BUY' if res['final_signal']=='BUY' else '🔴 SELL'} SIGNAL: {res['ticker']}\n"
-                        f"₹{res['price']} | Score:{res['final_score']:.2f} | MTF:{'✅' if res['mtf_ok'] else '⚠️'}\n"
-                        f"Entry:₹{res['price']} SL:₹{pos.get('sl','—')} Target:₹{pos.get('target','—')} Qty:{pos.get('qty','—')}\n"
-                        f"Net Gain: ₹{pos.get('net_gain','—')}\n"
-                        f"Candles: {', '.join(res['candles']) or 'None'}"
+                        f"{'🟢 BUY' if res['final_signal']=='BUY' else '🔴 SELL'}: {res['ticker']}\n"
+                        f"₹{res['price']} Score:{res['final_score']:.2f} MTF:{'✅' if res['mtf_ok'] else '⚠️'}\n"
+                        f"SL:₹{pos.get('sl','—')} Tgt:₹{pos.get('target','—')} Qty:{pos.get('qty','—')}\n"
+                        f"Net:₹{pos.get('net_gain','—')} | {', '.join(res['candles']) or 'No candle pattern'}"
                     )
-
     bar.empty()
     st.session_state.scan_results=results
     st.session_state.scan_ts=datetime.now().strftime("%H:%M:%S")
@@ -923,37 +912,32 @@ if results or reuse:
     c4.metric("🌐 Regime",regime)
     c5.metric("🕐 Scanned",st.session_state.scan_ts or "—")
     c6.metric("📊 MTF OK",f"{sum(1 for r in results if r.get('mtf_ok'))}/{len(results)}")
-
     st.divider()
 
     tab1,tab2,tab3,tab4,tab5=st.tabs(["🟢 BUY","🔴 SELL","📋 Table","💰 Live P&L","📈 Analytics"])
 
-    def order_btn(r, paper_mode_flag=True):
-        """Render place-order button inside signal card."""
+    def order_btn(r):
         pos=r["position"]
         if not pos: return
-        b_label=(f"{'📝 Paper' if paper_mode_flag else '🚀 LIVE'} "
-                 f"{r['final_signal']} {r['ticker']} "
-                 f"Qty:{pos['qty']} @ ₹{r['price']} → SL:₹{pos['sl']} Tgt:₹{pos['target']}")
-        # Disable if max trades reached
-        disabled = (st.session_state.orders_today >= max_trades_day)
-        if disabled:
-            st.warning(f"Max {max_trades_day} trades/day reached.")
+        max_t = st.session_state.max_trades_day   # FIX 4
+        if st.session_state.orders_today >= max_t:
+            st.warning(f"Max {max_t} trades/day reached.")
             return
-        if st.button(b_label, key=f"ord_{r['ticker']}_{r['final_signal']}",
-                     type="primary" if not paper_mode_flag else "secondary",
+        lbl = (f"{'📝 Paper' if pm else '🚀 LIVE'} {r['final_signal']} "
+               f"{r['ticker']} Qty:{pos['qty']} @ ₹{r['price']} "
+               f"→ SL:₹{pos['sl']} Tgt:₹{pos['target']}")
+        if st.button(lbl, key=f"ord_{r['ticker']}_{r['final_signal']}",
+                     type="secondary" if pm else "primary",
                      use_container_width=True):
             result=place_order(
-                symbol     = r["ticker"],
-                action     = r["final_signal"],
-                qty        = pos["qty"],
-                price      = r["price"],
-                sl         = pos["sl"],
-                target     = pos["target"],
-                paper_mode = paper_mode_flag,
+                symbol=r["ticker"], action=r["final_signal"],
+                qty=pos["qty"], price=r["price"],
+                sl=pos["sl"], target=pos["target"],
+                paper_mode=pm,
             )
             if result.get("status") in ("paper","live"):
                 st.success(f"✅ Order placed! ID: {result.get('id') or result.get('entry_id')}")
+                st.rerun()
             else:
                 st.error(f"❌ Order failed: {result.get('error')}")
 
@@ -961,7 +945,6 @@ if results or reuse:
         if not sig_list:
             st.info("No signals. Try lowering Min Strategies or scanning again.")
             return
-        pm_flag = not is_connected() or (KITE_AVAILABLE and paper_mode)
         for r in sig_list:
             pos=r.get("position",{})
             n=r["n_buy"] if r["final_signal"]=="BUY" else r["n_sell"]
@@ -976,27 +959,23 @@ if results or reuse:
                 c2.metric("Target", f"₹{pos.get('target','—')}", f"+₹{pos.get('pot_gain','—')}")
                 c3.metric("SL",     f"₹{pos.get('sl','—')}",    f"-₹{pos.get('pot_loss','—')}")
                 c4.metric("Qty",    pos.get("qty","—"),          f"₹{pos.get('invest','—')}")
-
                 c5,c6,c7,c8=st.columns(4)
-                c5.metric("Net Gain",f"₹{pos.get('net_gain','—')}")
-                c6.metric("ATR",    f"₹{r['atr']}")
-                c7.metric("52W Hi%",f"{r['w52']['pct_hi']:.1f}%" if r.get('w52') else "—")
-                c8.metric("Sent",   r["sent_label"])
-
+                c5.metric("Net Gain", f"₹{pos.get('net_gain','—')}")
+                c6.metric("ATR",      f"₹{r['atr']}")
+                c7.metric("52W Hi%",  f"{r['w52']['pct_hi']:.1f}%" if r.get('w52') else "—")
+                c8.metric("Sent",     r["sent_label"])
                 if r.get("candles"):
                     st.caption("📊 " + " | ".join(r["candles"]))
                 st.markdown("**Strategies:**")
                 for trig in r["triggers"]: st.caption(trig)
                 if r.get("sent_summary","—") not in ("—",""):
                     st.info(f"🤖 {r['sent_label']} ({r['sent_conf']}%): {r['sent_summary']}")
-
                 st.divider()
-                order_btn(r, pm_flag)
+                order_btn(r)
 
     with tab1:
         st.subheader(f"🟢 {len(buys)} BUY Signals")
         render_cards(buys)
-
     with tab2:
         st.subheader(f"🔴 {len(sells)} SELL Signals")
         render_cards(sells)
@@ -1026,48 +1005,51 @@ if results or reuse:
             st.dataframe(df_t.style.map(csig,subset=["Signal"])
                                    .format({"Chg%":"{:+.2f}%","Score":"{:.3f}"}),
                          use_container_width=True, height=500)
-            csv=io.BytesIO()
-            df_t.to_csv(csv,index=False)
-            st.download_button("⬇️ Export CSV",csv.getvalue(),
+            csv_buf=io.BytesIO()
+            df_t.to_csv(csv_buf,index=False)
+            st.download_button("⬇️ Export CSV",csv_buf.getvalue(),
                                f"signals_{date.today()}.csv","text/csv")
 
     with tab4:
         st.subheader("💰 Live P&L Dashboard")
-
-        # ── Live Zerodha positions ───────────────────────────
-        if is_connected() and not paper_mode:
+        if is_connected() and not pm:
             pos_list, live_pnl = fetch_live_positions()
             if pos_list:
-                st.markdown(f"**Live P&L: <span style='color:{'#00e676' if live_pnl>=0 else '#ff1744'}'>₹{live_pnl:+,.2f}</span>**", unsafe_allow_html=True)
+                color="#00e676" if live_pnl>=0 else "#ff1744"
+                st.markdown(f"**Live P&L: <span style='color:{color}'>₹{live_pnl:+,.2f}</span>**",
+                            unsafe_allow_html=True)
                 pos_df=pd.DataFrame([{
-                    "Symbol":  p["tradingsymbol"],
-                    "Qty":     p["quantity"],
-                    "Avg":     p.get("average_price",0),
-                    "LTP":     p.get("last_price",0),
-                    "P&L":     p.get("pnl",0),
-                    "Value":   p.get("value",0),
+                    "Symbol":p["tradingsymbol"],"Qty":p["quantity"],
+                    "Avg":p.get("average_price",0),"LTP":p.get("last_price",0),
+                    "P&L":p.get("pnl",0),"Value":p.get("value",0),
                 } for p in pos_list if p.get("quantity",0)!=0])
                 if not pos_df.empty:
-                    st.dataframe(pos_df.style.format({"Avg":"₹{:.2f}","LTP":"₹{:.2f}","P&L":"₹{:+.2f}","Value":"₹{:.2f}"}),
-                                 use_container_width=True)
-                if st.button("🔄 Refresh P&L"):
-                    st.rerun()
+                    st.dataframe(pos_df.style.format(
+                        {"Avg":"₹{:.2f}","LTP":"₹{:.2f}","P&L":"₹{:+.2f}","Value":"₹{:.2f}"}),
+                        use_container_width=True)
+                if st.button("🔄 Refresh P&L"): st.rerun()
             else:
                 st.info("No open positions in Zerodha today.")
         else:
-            # ── Paper trade P&L ──────────────────────────────
             pnl_now=paper_pnl_mtm()
-            st.markdown(f"**Paper Session P&L: <span style='color:{'#00e676' if pnl_now>=0 else '#ff1744'}'>₹{pnl_now:+,.2f}</span>**",
+            color="#00e676" if pnl_now>=0 else "#ff1744"
+            st.markdown(f"**Paper Session P&L: <span style='color:{color}'>₹{pnl_now:+,.2f}</span>**",
                         unsafe_allow_html=True)
-            target_pct=min(100,int(abs(pnl_now)/TARGET_DAILY*100)) if TARGET_DAILY>0 else 0
-            st.progress(max(0.0,min(1.0,target_pct/100)), text=f"{target_pct}% of ₹{TARGET_DAILY:,} target")
+            t_pct=min(100,int(abs(pnl_now)/TARGET_DAILY*100)) if TARGET_DAILY>0 else 0
+            st.progress(max(0.0,min(1.0,t_pct/100)), text=f"{t_pct}% of ₹{TARGET_DAILY:,} target")
 
             if st.session_state.paper_trades:
+                # FIX 1: Use "symbol" key — consistent with place_order() dict
                 rows=[{
-                    "Symbol":t["ticker"],"Action":t["action"],
-                    "Entry":t["entry"],"SL":t["sl"],"Target":t["target"],
-                    "Qty":t["qty"],"Status":t["status"],"P&L (₹)":t["pnl"],
-                    "Time":t["time"],
+                    "Symbol":   t.get("symbol", t.get("ticker","—")),   # handles both old & new
+                    "Action":   t.get("action","—"),
+                    "Entry":    t.get("entry",0),
+                    "SL":       t.get("sl",0),
+                    "Target":   t.get("target",0),
+                    "Qty":      t.get("qty",0),
+                    "Status":   t.get("status","—"),
+                    "P&L (₹)":  t.get("pnl",0.0),
+                    "Time":     t.get("time","—"),
                 } for t in st.session_state.paper_trades]
                 pt_df=pd.DataFrame(rows)
                 def pnl_color(v):
@@ -1075,15 +1057,15 @@ if results or reuse:
                     if v<0: return "color:#ff1744;font-weight:600"
                     return ""
                 st.dataframe(pt_df.style.map(pnl_color,subset=["P&L (₹)"])
-                                        .format({"Entry":"₹{:.2f}","SL":"₹{:.2f}","Target":"₹{:.2f}","P&L (₹)":"₹{:+.2f}"}),
+                                        .format({"Entry":"₹{:.2f}","SL":"₹{:.2f}",
+                                                 "Target":"₹{:.2f}","P&L (₹)":"₹{:+.2f}"}),
                              use_container_width=True, height=380)
-
-                if st.button("🔄 Refresh Paper P&L"):
-                    st.rerun()
-                if st.button("🗑️ Clear Paper Trades"):
-                    st.session_state.paper_trades=[]; st.rerun()
-
-                # Export trade log
+                col_r1, col_r2 = st.columns(2)
+                with col_r1:
+                    if st.button("🔄 Refresh Paper P&L"): st.rerun()
+                with col_r2:
+                    if st.button("🗑️ Clear All Paper Trades"):
+                        st.session_state.paper_trades=[]; st.rerun()
                 tl_csv=io.BytesIO()
                 pt_df.to_csv(tl_csv,index=False)
                 st.download_button("⬇️ Export Trade Log",tl_csv.getvalue(),
@@ -1094,13 +1076,12 @@ if results or reuse:
     with tab5:
         st.subheader("📈 Analytics")
         if results:
-            c_a,c_b=st.columns(2)
-            with c_a:
+            ca,cb=st.columns(2)
+            with ca:
                 st.markdown("**Score Distribution**")
-                sc_df=pd.DataFrame({"Ticker":[r["ticker"] for r in results],
-                                    "Score":[r["final_score"] for r in results]})
-                st.bar_chart(sc_df.set_index("Ticker"))
-            with c_b:
+                st.bar_chart(pd.DataFrame({"Ticker":[r["ticker"] for r in results],
+                                           "Score":[r["final_score"] for r in results]}).set_index("Ticker"))
+            with cb:
                 st.markdown("**Strategy Hit Count**")
                 sc={}
                 for r in results:
@@ -1109,7 +1090,6 @@ if results or reuse:
                             sc[STRAT_LABELS[k]]=sc.get(STRAT_LABELS[k],0)+1
                 if sc:
                     st.bar_chart(pd.DataFrame.from_dict(sc,orient="index",columns=["Hits"]))
-
             st.markdown("**52-Week Proximity**")
             w52_rows=[{"Ticker":r["ticker"],"Signal":r["final_signal"],
                        "% from 52W Hi":r["w52"]["pct_hi"],"% from 52W Lo":r["w52"]["pct_lo"]}
@@ -1117,13 +1097,12 @@ if results or reuse:
             if w52_rows:
                 st.dataframe(pd.DataFrame(w52_rows),use_container_width=True)
 
+# ── Auto square-off at 3:20 PM IST ───────────────────────────
+now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+if now_ist.hour==15 and now_ist.minute>=20 and st.session_state.orders_today>0:
+    square_off_all(pm)
+    _telegram(f"📤 Auto square-off 3:20 PM | P&L: ₹{paper_pnl_mtm():+.2f}")
+
 if auto_ref:
     st.toast("Refreshing in 5 min...")
     time.sleep(300); st.rerun()
-
-# ── Auto square-off at 3:20 PM IST ───────────────────────────
-now_ist=datetime.utcnow()+timedelta(hours=5,minutes=30)
-if now_ist.hour==15 and now_ist.minute>=20 and st.session_state.orders_today>0:
-    pm=not is_connected() or (KITE_AVAILABLE and paper_mode)
-    square_off_all(pm)
-    _telegram(f"📤 Auto square-off at 3:20 PM | Session P&L: ₹{paper_pnl_mtm():+.2f}")

@@ -151,9 +151,7 @@ def yf_to_kite(ticker: str) -> str:
     sym = ticker.replace(".NS","")
     remap = {"BAJAJ-AUTO":"BAJAJ-AUTO","MCDOWELL-N":"MCDOWELL-N"}
     return remap.get(sym, sym)
-import requests
-ip = requests.get("https://api.ipify.org").text
-st.sidebar.info(f"App IP: {ip}")
+
 # ╔══════════════════════════════════════════════════════════════╗
 # ║               ORDER PLACEMENT                               ║
 # FIX 1: Unified trade dict key to "symbol" everywhere.        ║

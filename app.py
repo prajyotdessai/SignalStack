@@ -1,14 +1,3 @@
-import requests
-
-@st.cache_data(ttl=600)
-def get_current_ip():
-    try:
-        return requests.get("https://api.ipify.org", timeout=3).text.strip()
-    except:
-        return "unknown"
-
-current_ip = get_current_ip()
-st.sidebar.caption(f"App IP: `{current_ip}`")
 """
 NSE PRO TRADER v5.0 — EXPANDED UNIVERSE + 6 NEW STRATEGIES
 ============================================================
@@ -51,6 +40,17 @@ import concurrent.futures
 import io
 from datetime import datetime, date, timedelta
 import anthropic
+import requests
+
+@st.cache_data(ttl=600)
+def get_current_ip():
+    try:
+        return requests.get("https://api.ipify.org", timeout=3).text.strip()
+    except:
+        return "unknown"
+
+current_ip = get_current_ip()
+st.sidebar.caption(f"App IP: `{current_ip}`")
 
 try:
     from kiteconnect import KiteConnect
@@ -1104,6 +1104,8 @@ with st.sidebar:
 
     if st.button("📤 Square Off All",type="secondary",use_container_width=True):
         square_off_all(st.session_state.paper_mode); st.success("All positions squared off!")
+        current_ip = get_current_ip()
+st.sidebar.caption(f"App IP: `{current_ip}`")
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║                        MAIN UI                              ║

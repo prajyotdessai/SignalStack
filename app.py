@@ -1,3 +1,14 @@
+import requests
+
+@st.cache_data(ttl=600)
+def get_current_ip():
+    try:
+        return requests.get("https://api.ipify.org", timeout=3).text.strip()
+    except:
+        return "unknown"
+
+current_ip = get_current_ip()
+st.sidebar.caption(f"App IP: `{current_ip}`")
 """
 NSE PRO TRADER v5.0 — EXPANDED UNIVERSE + 6 NEW STRATEGIES
 ============================================================

@@ -1,0 +1,15 @@
+# railway.json — Deploy NSE Pro Trader on Railway.app (free tier)
+# Railway uses IP ranges NOT blocked by Yahoo Finance
+# Free tier: 500 hours/month (enough for market hours 9-4 PM IST weekdays)
+{
+    "$schema": "https://railway.app/railway.schema.json",
+    "build": {
+        "builder": "NIXPACKS"
+    },
+    "deploy": {
+        "startCommand": "streamlit run pro_trading_system.py --server.port=$PORT --server.headless=true --browser.gatherUsageStats=false",
+        "healthcheckPath": "/",
+        "restartPolicyType": "ON_FAILURE",
+        "restartPolicyMaxRetries": 3
+    }
+}

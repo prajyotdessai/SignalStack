@@ -1393,6 +1393,22 @@ if results:
                 cap_cnt={"Large Cap":sum(1 for r in results if r["cap_type"]=="Large Cap"),
                          "Mid Cap": sum(1 for r in results if r["cap_type"]=="Mid Cap")}
                 st.bar_chart(pd.DataFrame.from_dict(cap_cnt,orient="index",columns=["Count"]))
+              if do_scan:
+    if not enabled_keys: st.warning("Select at least one strategy."); st.stop()
+    bar=st.progress(0,f"⚡ Fetching {len(UNIVERSE)} stocks in parallel...")
+    imap={"Intraday (5m)":"5m","Intraday (15m)":"15m","Swing (Daily)":"1d"}
+    pmap={"Intraday (5m)":"60d","Intraday (15m)":"60d","Swing (Daily)":"2y"}
+    data_cache=fetch_parallel(UNIVERSE,imap[mode],pmap[mode],workers=16)
+    
+    # 🆕 ADD DIAGNOSTIC
+    success_count = sum(1 for v in data_cache.values() if v is not None)
+    st.info(f"📊 Data fetch: {success_count}/{len(UNIVERSE)} stocks successful")
+    if success_count == 0:
+        st.error("❌ All data fetches failed! Check data source (see green/red banner above)")
+        st.stop()
+    
+    bar.progress(0.35,"✅ Data ready. Fetching Nifty 50 benchmark...")
+    # ... rest continues ...
 
     # ╔══════════════════════════════════════════════════════════╗
     # ║              TAB 6 — PORTFOLIO REBALANCER               ║

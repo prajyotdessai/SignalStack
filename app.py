@@ -61,63 +61,6 @@ div[data-testid="stExpander"] { border:1px solid #21262d !important; }
 .stButton > button { font-weight:600; }
 </style>
 """, unsafe_allow_html=True)
-if do_scan:
-
-    # Validate strategy selection
-    if not enabled_keys:
-        st.warning("Select at least one strategy.")
-        st.stop()
-
-    # Progress bar start
-    bar = st.progress(
-        0,
-        text=f"⚡ Fetching {len(UNIVERSE)} stocks in parallel..."
-    )
-
-    # Interval & period mapping
-    imap = {
-        "Intraday (5m)": "5m",
-        "Intraday (15m)": "15m",
-        "Swing (Daily)": "1d"
-    }
-
-    pmap = {
-        "Intraday (5m)": "60d",
-        "Intraday (15m)": "60d",
-        "Swing (Daily)": "2y"
-    }
-
-    # Fetch data
-    data_cache = fetch_parallel(
-        UNIVERSE,
-        imap[mode],
-        pmap[mode],
-        workers=16
-    )
-
-    # 🆕 Diagnostic
-    success_count = sum(
-        1 for v in data_cache.values() if v is not None
-    )
-
-    st.info(
-        f"📊 Data fetch: {success_count}/{len(UNIVERSE)} stocks successful"
-    )
-
-    # Hard failure case
-    if success_count == 0:
-        st.error(
-            "❌ All data fetches failed! Check data source (see banner above)"
-        )
-        st.stop()
-
-    # Update progress
-    bar.progress(
-        0.35,
-        text="✅ Data ready. Fetching Nifty 50 benchmark..."
-    )
-
-    # ... continue your logic here ...
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║                    STOCK UNIVERSES                          ║

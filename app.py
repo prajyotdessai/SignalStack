@@ -1225,20 +1225,25 @@ if do_scan:
     st.session_state.scan_results=results; st.session_state.scan_ts=datetime.now().strftime("%H:%M:%S")
     st.rerun()
 
-results=st.session_state.scan_results
+results = st.session_state.scan_results
 
-if results or reuse:
-    buys =sorted([r for r in results if r["final_signal"]=="BUY"],  key=lambda x:-x["final_score"])
-    sells=sorted([r for r in results if r["final_signal"]=="SELL"], key=lambda x:x["final_score"])
-    c1,c2,c3,c4,c5,c6,c7=st.columns(7)
-    c1.metric("🟢 BUY",  len(buys))
+# Only show results UI if we have data
+if results:
+    buys = sorted([r for r in results if r["final_signal"] == "BUY"], key=lambda x: -x["final_score"])
+    sells = sorted([r for r in results if r["final_signal"] == "SELL"], key=lambda x: x["final_score"])
+    
+    # ALWAYS show metrics, even if empty
+    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+    c1.metric("🟢 BUY", len(buys))
     c2.metric("🔴 SELL", len(sells))
-    c3.metric("📊 Total",len(results))
-    c4.metric("🌐 Regime",regime)
-    c5.metric("🏦 Large",sum(1 for r in results if r["cap_type"]=="Large Cap"))
-    c6.metric("📈 Mid",  sum(1 for r in results if r["cap_type"]=="Mid Cap"))
-    c7.metric("🕐 Scanned",st.session_state.scan_ts or "—")
-    if not results: st.warning("No signals at current filters. Try: Min Strategies=2, Min Score=0.25")
+    c3.metric("📊 Total", len(results))
+    c4.metric("🌐 Regime", regime)
+    c5.metric("🏦 Large", sum(1 for r in results if r["cap_type"] == "Large Cap"))
+    c6.metric("📈 Mid", sum(1 for r in results if r["cap_type"] == "Mid Cap"))
+    c7.metric("🕐 Scanned", st.session_state.scan_ts or "—")
+    
+    if not results:
+        st.warning("No signals at current filters. Try: Min Strategies=2, Min Score=0.25")
     st.divider()
 
     tab1,tab2,tab3,tab4,tab5,tab6=st.tabs([

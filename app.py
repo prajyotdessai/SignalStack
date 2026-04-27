@@ -42,6 +42,11 @@ FIXES vs v5.1:
   🐛 FIX 10 — @st.cache_data(ttl=300) on get_data_kite uses _kite_key and
               _access_token as cache keys (leading underscore = excluded from
               key in Streamlit). Changed parameter names so they ARE part of key.
+
+  🐛 FIX 11 — NameError: api_key and access_token were assigned AFTER the first
+              call that used them (get_nifty50_returns). Hoisted both variable
+              assignments to the very top of the do_scan block, before
+              fetch_parallel_kite and get_nifty50_returns calls.
 """
 
 import streamlit as st
@@ -971,7 +976,7 @@ def ai_sentiment_batch(payload_json: str) -> dict:
 # ══════════════════════════════════════════════════════════════
 with st.sidebar:
     st.markdown('<span class="kite-badge">⚡ Kite Native v5.2</span> '
-                '<span class="fix-badge">10 bugs fixed</span>', unsafe_allow_html=True)
+                '<span class="fix-badge">11 bugs fixed</span>', unsafe_allow_html=True)
     st.header("⚙️ Settings")
 
     st.subheader("🔗 Zerodha Kite Connect")
@@ -1044,18 +1049,8 @@ with st.sidebar:
                     "[developers.kite.trade](https://developers.kite.trade) "
                     "**must match** this app's URL exactly:"
                 )
-                # Try to auto-detect the app's public URL
-                try:
-                    import urllib.parse
-                    # Streamlit Cloud sets SERVER_ADDRESS in runtime config
-                    from streamlit.web.server.server import Server  # type: ignore
-                    addr = Server.get_current()._session_manager._main_script_path
-                except Exception:
-                    addr = None
-
                 app_url = st.query_params.get("_stcore_app_url", "") or ""
                 if not app_url:
-                    # Fallback: ask user
                     app_url = st.text_input(
                         "Your Streamlit Cloud app URL",
                         placeholder="https://yourapp.streamlit.app",
@@ -1131,7 +1126,6 @@ with st.sidebar:
                         ensure_tokens()
                         st.rerun()
                 except Exception as e:
-                    # Show the FULL error — no silent swallowing
                     import traceback
                     st.error(f"❌ Connection failed: {e}")
                     err_detail = traceback.format_exc()
@@ -1216,7 +1210,7 @@ with st.sidebar:
 # ══════════════════════════════════════════════════════════════
 #  MAIN UI
 # ══════════════════════════════════════════════════════════════
-st.title("📈 NSE Pro Trader v5.2 — Kite Native (10 Bugs Fixed)")
+st.title("📈 NSE Pro Trader v5.2 — Kite Native (11 Bugs Fixed)")
 
 if not is_connected():
     st.warning("⚠️ **Not connected to Kite Connect.** Please authenticate in the sidebar.")
@@ -1229,7 +1223,11 @@ if not st.session_state.instrument_tokens:
     st.error("⚠️ Instrument tokens not loaded. Click **Load Instrument Tokens** in the sidebar.")
     st.stop()
 
-regime    = market_regime(st.secrets["KITE_API_KEY"], st.session_state.access_token)
+# Read credentials once here in the main thread for use throughout this run
+api_key      = st.secrets["KITE_API_KEY"]
+access_token = st.session_state.access_token
+
+regime    = market_regime(api_key, access_token)
 rw        = regime_weights(regime)
 rcss      = {"Bull":"regime-bull","Bear":"regime-bear","Sideways":"regime-side"}.get(regime,"regime-side")
 pm        = st.session_state.paper_mode
@@ -1277,7 +1275,14 @@ if do_scan:
         st.warning("Select at least one strategy."); st.stop()
 
     st.session_state.scan_errors = []   # reset error log
-    _DATA_CACHE.clear()                 # clear in-memory cache for fresh scan
+    _DATA_CACHE.clear()                  # clear in-memory cache for fresh scan
+
+    # ── FIX 11: Hoist api_key / access_token / token_map BEFORE any
+    #            function call that needs them (get_nifty50_returns was
+    #            the first caller but these vars were assigned much later).
+    api_key      = st.secrets["KITE_API_KEY"]
+    access_token = st.session_state.access_token
+    token_map    = dict(st.session_state.instrument_tokens)
 
     bar = st.progress(0, f"⚡ Fetching {len(UNIVERSE)} stocks via Kite...")
     data_cache = fetch_parallel_kite(UNIVERSE, kite_interval, workers=12)
@@ -1285,7 +1290,7 @@ if do_scan:
     fetched = sum(1 for v in data_cache.values() if v is not None)
     bar.progress(0.35, f"✅ Data ready: {fetched}/{len(UNIVERSE)} stocks fetched. Getting Nifty 50...")
 
-    nifty_ret = get_nifty50_returns(api_key, access_token)
+    nifty_ret = get_nifty50_returns(api_key, access_token)   # ✅ now defined above
     bar.progress(0.40, "🧠 Running 16 strategies...")
 
     sent_cache = {}
@@ -1302,11 +1307,6 @@ if do_scan:
                                  "headlines":list(get_news(sym))})
         for i in range(0, len(payload), 5):
             sent_cache.update(ai_sentiment_batch(json.dumps(payload[i:i+5])))
-
-    # Read session_state in main thread before the scan loop
-    api_key      = st.secrets["KITE_API_KEY"]
-    access_token = st.session_state.access_token
-    token_map    = dict(st.session_state.instrument_tokens)
 
     results  = []
     pre_filt = 0   # count signals before filters

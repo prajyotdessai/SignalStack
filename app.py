@@ -998,15 +998,18 @@ with st.sidebar:
             st.warning("⚠️ LIVE MODE — Real orders will be placed!")
 
         if is_connected():
-            try: name = st.session_state.kite.profile().get("user_name","")
-            except: name = ""
+            try:
+                name = st.session_state.kite.profile().get("user_name", "")
+            except Exception as e:
+                name = ""
+                st.warning(f"Profile fetch failed: {e}")
             st.success(f"✅ Connected{' — '+name if name else ''}")
             tok_count = len(st.session_state.instrument_tokens)
             if tok_count:
                 st.caption(f"🗄️ {tok_count:,} instrument tokens loaded")
             else:
                 if st.button("📥 Load Instrument Tokens", use_container_width=True):
-                    with st.spinner("Loading NSE instrument list..."):
+                    with st.spinner("Loading NSE instruments (~5 sec)..."):
                         ensure_tokens()
                     st.rerun()
             if st.button("🔌 Disconnect", use_container_width=True):
@@ -1015,20 +1018,132 @@ with st.sidebar:
                 st.session_state.instrument_tokens = {}
                 _DATA_CACHE.clear()
                 st.rerun()
+
         else:
-            if "KITE_API_KEY" in st.secrets:
-                kite_obj = kite_login_obj()
-                if kite_obj:
-                    st.markdown(f"**Step 1:** [Login Zerodha ↗]({kite_obj.login_url()})")
-                    req_token = st.text_input("Step 2: Paste request_token",
-                                              placeholder="Paste from redirect URL...")
-                    if st.button("🔑 Connect", type="primary") and req_token.strip():
-                        with st.spinner("Connecting..."):
-                            if kite_set_token(kite_obj, req_token.strip()):
-                                ensure_tokens()
-                                st.success("✅ Connected!"); st.rerun()
-            else:
-                st.info("Add `KITE_API_KEY` + `KITE_API_SECRET` to secrets.toml")
+            # ── secrets check ─────────────────────────────────
+            missing = [k for k in ["KITE_API_KEY","KITE_API_SECRET"]
+                       if k not in st.secrets]
+            if missing:
+                st.error(f"Missing in Streamlit secrets: {', '.join(missing)}")
+                st.info("Go to your app → Settings → Secrets and add both keys.")
+                st.stop()
+
+            kite_obj = kite_login_obj()
+            if not kite_obj:
+                st.error("Could not initialise KiteConnect. Check KITE_API_KEY.")
+                st.stop()
+
+            # Show the login URL so user can verify redirect is correct
+            login_url = kite_obj.login_url()
+            st.markdown(f"**Step 1:** [Login Zerodha ↗]({login_url})")
+
+            # ── redirect URL helper ───────────────────────────
+            with st.expander("⚠️ Check your redirect URL first", expanded=True):
+                st.markdown(
+                    "Your Kite app's **Redirect URL** on "
+                    "[developers.kite.trade](https://developers.kite.trade) "
+                    "**must match** this app's URL exactly:"
+                )
+                # Try to auto-detect the app's public URL
+                try:
+                    import urllib.parse
+                    # Streamlit Cloud sets SERVER_ADDRESS in runtime config
+                    from streamlit.web.server.server import Server  # type: ignore
+                    addr = Server.get_current()._session_manager._main_script_path
+                except Exception:
+                    addr = None
+
+                app_url = st.query_params.get("_stcore_app_url", "") or ""
+                if not app_url:
+                    # Fallback: ask user
+                    app_url = st.text_input(
+                        "Your Streamlit Cloud app URL",
+                        placeholder="https://yourapp.streamlit.app",
+                        help="Copy from your browser address bar (without any ?... params)"
+                    )
+                if app_url:
+                    st.code(app_url, language=None)
+                    st.caption("👆 Set this EXACTLY as the Redirect URL in your Kite app.")
+                else:
+                    st.caption("Enter your app URL above → copy it → paste into Kite developer console.")
+
+            st.divider()
+
+            # ── Full redirect URL paste (easiest method) ──────
+            st.markdown("**Step 2:** After Zerodha login, paste the **full redirect URL** "
+                        "from your browser address bar here:")
+            full_url = st.text_area(
+                "Full redirect URL",
+                placeholder="https://yourapp.streamlit.app/?request_token=XXXXXX&action=login&status=success",
+                height=80,
+                help="Paste the entire URL from your browser after completing Zerodha login"
+            )
+
+            # Auto-extract token from full URL
+            req_token = ""
+            if full_url.strip():
+                try:
+                    from urllib.parse import urlparse, parse_qs
+                    parsed = urlparse(full_url.strip())
+                    params = parse_qs(parsed.query)
+                    token_list = params.get("request_token", [])
+                    if token_list:
+                        req_token = token_list[0]
+                        st.success(f"✅ Token extracted: `{req_token[:8]}...` ({len(req_token)} chars)")
+                    elif "status=error" in full_url:
+                        st.error("❌ Zerodha returned status=error. "
+                                 "Check that your Redirect URL in developers.kite.trade "
+                                 "matches this app's URL exactly.")
+                    else:
+                        st.warning("Could not find request_token in URL. "
+                                   "Make sure you paste the full URL after login.")
+                except Exception as ex:
+                    st.error(f"URL parse error: {ex}")
+
+            # Also allow manual token paste as fallback
+            st.markdown("*Or paste just the token directly:*")
+            manual_token = st.text_input(
+                "request_token (manual)",
+                placeholder="AbCdEfGhIjKlMnOpQrStUv...",
+                help="The value of request_token= from the redirect URL"
+            )
+            if manual_token.strip():
+                req_token = manual_token.strip()
+
+            # ── Connect button ────────────────────────────────
+            if st.button("🔑 Connect", type="primary",
+                         use_container_width=True,
+                         disabled=not bool(req_token)):
+                st.info(f"Attempting connection with token: `{req_token[:8]}...`")
+                try:
+                    data = kite_obj.generate_session(
+                        req_token,
+                        api_secret=st.secrets["KITE_API_SECRET"]
+                    )
+                    access_token = data.get("access_token", "")
+                    if not access_token:
+                        st.error(f"generate_session returned no access_token. Full response: {data}")
+                    else:
+                        kite_obj.set_access_token(access_token)
+                        st.session_state.access_token = access_token
+                        st.session_state.kite = kite_obj
+                        st.success("✅ Session created! Loading instrument tokens...")
+                        ensure_tokens()
+                        st.rerun()
+                except Exception as e:
+                    # Show the FULL error — no silent swallowing
+                    import traceback
+                    st.error(f"❌ Connection failed: {e}")
+                    err_detail = traceback.format_exc()
+                    with st.expander("Full error details"):
+                        st.code(err_detail)
+                    st.info(
+                        "**Common causes:**\n"
+                        "- Token expired (>2 min) → log in again\n"
+                        "- Token already used → each token is one-time only\n"
+                        "- Wrong API secret → verify KITE_API_SECRET in secrets\n"
+                        "- Redirect URL mismatch → must match exactly in Kite app settings"
+                    )
 
     st.divider()
 
@@ -1114,7 +1229,7 @@ if not st.session_state.instrument_tokens:
     st.error("⚠️ Instrument tokens not loaded. Click **Load Instrument Tokens** in the sidebar.")
     st.stop()
 
-regime    = market_regime()
+regime    = market_regime(st.secrets["KITE_API_KEY"], st.session_state.access_token)
 rw        = regime_weights(regime)
 rcss      = {"Bull":"regime-bull","Bear":"regime-bear","Sideways":"regime-side"}.get(regime,"regime-side")
 pm        = st.session_state.paper_mode
